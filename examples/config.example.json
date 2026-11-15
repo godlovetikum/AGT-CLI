@@ -3,6 +3,8 @@
   "defaultLane": "edit",
   "cooldownSec": 300,
   "requestTimeoutSec": 120,
+  "manusTimeoutSec": 600,
+  "manusPollMs": 2000,
   "commandTimeoutSec": 120,
   "maxSteps": 25,
   "maxToolChars": 30000,
@@ -12,6 +14,7 @@
     "big": "gemini/gemini-3-flash-preview"
   },
   "providers": {
+    "manus": { "type": "manus", "url": "https://api.manus.ai", "keyEnv": "MANUS_API_KEY" },
     "gemini": { "url": "https://generativelanguage.googleapis.com/v1beta/openai", "keyEnv": "GEMINI_API_KEY", "keepGeminiFields": true },
     "groq": { "url": "https://api.groq.com/openai/v1", "keyEnv": "GROQ_API_KEY" },
     "cerebras": { "url": "https://api.cerebras.ai/v1", "keyEnv": "CEREBRAS_API_KEY" },

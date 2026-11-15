@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add a separately pinned Manus API v2 task provider (`manus/agent`) with per-turn structured tool-request translation, private task continuity, account-aware recovery, and no automatic Manus-side action confirmations.
+- Add selectable initial project context and editable persistent Manus instructions, project-knowledge templates, and reusable workflow resources (`agt resources`).
+- Include Manus setup, configuration, API documentation, and mock task/router regression tests while leaving existing synchronous provider lanes unchanged.
+
 ## 1.1.0
 
 Renamed to **agt** and published to npm as `agt-cli` (install with `npm install -g agt-cli`). The command is `agt` (also `agt-cli`).

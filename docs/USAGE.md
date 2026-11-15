@@ -37,10 +37,13 @@ Commands (`run_command`) ask `[y]es [n]o` and print their full output.
 
 Pasted multi-line text is sent as one message. Ctrl+C cancels a running request.
 
+Manus is selected separately from lanes because its API runs asynchronous tasks: use `/model manus/agent` in chat or start with `agt --model manus/agent`. Each turn may take longer and consumes Manus account credits. AGT still owns local file and command access, and every proposed write or command keeps the normal approval prompt. Run `agt resources` to find editable integration instructions, project-knowledge templates, and workflow notes.
+
 ## Lanes versus model pins
 
 - A **lane** is an ordered list in `config.json`. The router tries each entry in turn and parks a model for a while when it is rate-limited or failing.
 - A **pin** (`/model`, `--model`) names one exact model. Only that model is tried; if it fails you see the error instead of a silent switch.
+- `manus/agent` is a task provider and cannot be placed in a lane; its asynchronous execution does not fit ordered synchronous failover.
 - Lane and pin are independent: `/lane plan` keeps your pin, `/model auto` keeps your lane. The prompt shows `[edit]` or `[model: fast]`.
 - Pins are saved in the chat and restored by `agt resume`.
 

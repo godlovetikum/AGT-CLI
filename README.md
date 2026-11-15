@@ -1,8 +1,8 @@
 # agt
 
-A free-tier coding agent for your terminal. It talks to free LLM APIs (Gemini, Groq, ...) through a small local router that fails over when one is rate-limited, edits your files **only after you approve each change**, remembers your chats, and explains what is wrong when something breaks.
+A coding agent for your terminal. It talks to OpenAI-compatible model APIs (Gemini, Groq, ...) through a small local router that fails over when one is rate-limited. You can also select Manus as a remote task agent with a local-operation bridge. AGT edits your files **only after you approve each change**, remembers your chats, and explains what is wrong when something breaks.
 
-- **Free by design:** use the free tiers you already have. Zero dependencies.
+- **Flexible provider costs:** use free tiers where available; Manus is optional and consumes Manus credits. Zero dependencies.
 - **You stay in control:** every file write and command asks first (`y` / `n` / `d` diff / `v` view / `s` stage a copy). Every change is backed up and can be undone.
 - **Works everywhere:** Windows, macOS, Linux and Android ([Termux](https://termux.dev)).
 - **Built to be debugged:** `agt doctor`, a router `/health` endpoint, readable logs, saved sessions.
@@ -35,13 +35,13 @@ Update later with `agt update`. Remove with `npm uninstall -g agt-cli`.
 ## Quick start
 
 ```
-agt setup          # paste your free API keys (input is hidden)
+agt setup          # paste provider API keys (input is hidden; skip any you do not use)
 agt doctor         # checks everything and says how to fix what is wrong
 cd my-project
 agt                # start chatting
 ```
 
-Get free keys: [Gemini](https://aistudio.google.com/apikey), [Groq](https://console.groq.com/keys). One is enough; two give you failover.
+Get keys: [Gemini](https://aistudio.google.com/apikey), [Groq](https://console.groq.com/keys), or [Manus](https://manus.im/app/developers). One chat-model provider is enough; two give you failover. Manus is selected separately and consumes Manus account credits.
 
 ## Lanes and models
 
@@ -53,6 +53,7 @@ A **model pin** is separate from lanes: it forces one exact model with no failov
 /lane plan                          switch lane
 /model fast                         pin an alias from your config
 /model groq/openai/gpt-oss-120b     pin any provider/model-id
+/model manus/agent                  use Manus through its task API
 /model auto                         unpin, go back to the lane
 /models live                        list every model your providers offer
 ```
@@ -89,6 +90,6 @@ In chat, `/help` shows the slash commands (`/compact` shrinks a long chat to sav
 
 ## More
 
-[Usage](docs/USAGE.md) · [Configuration](docs/CONFIG.md) · [Providers](docs/PROVIDERS.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Architecture](docs/ARCHITECTURE.md) · [Releasing](docs/RELEASING.md) · [Changelog](CHANGELOG.md)
+[Usage](docs/USAGE.md) · [Configuration](docs/CONFIG.md) · [Providers](docs/PROVIDERS.md) · [Manus integration](docs/MANUS.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Architecture](docs/ARCHITECTURE.md) · [Releasing](docs/RELEASING.md) · [Changelog](CHANGELOG.md)
 
 MIT licensed.

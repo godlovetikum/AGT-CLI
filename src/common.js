@@ -19,6 +19,8 @@ const P = {
   sessions: path.join(HOME, 'sessions'),
   backups: path.join(HOME, 'backups'),
   proposed: path.join(HOME, 'proposed'),
+  resources: path.join(HOME, 'resources'),
+  manusInstructions: path.join(HOME, 'manus-instructions.md'),
   changes: path.join(HOME, 'changes.jsonl'),
 };
 
@@ -27,6 +29,8 @@ const DEFAULT_CONFIG = {
   defaultLane: 'edit',
   cooldownSec: 300,
   requestTimeoutSec: 120,
+  manusTimeoutSec: 600,
+  manusPollMs: 2000,
   commandTimeoutSec: 120,
   maxSteps: 25,
   maxToolChars: 30000,
@@ -37,6 +41,7 @@ const DEFAULT_CONFIG = {
     big: 'gemini/gemini-3-flash-preview',
   },
   providers: {
+    manus: { type: 'manus', url: 'https://api.manus.ai', keyEnv: 'MANUS_API_KEY' },
     gemini: { url: 'https://generativelanguage.googleapis.com/v1beta/openai', keyEnv: 'GEMINI_API_KEY', keepGeminiFields: true },
     groq: { url: 'https://api.groq.com/openai/v1', keyEnv: 'GROQ_API_KEY' },
   },
@@ -78,7 +83,7 @@ function formatLog(r) {
 
 // ---------- files ----------
 function ensureDirs() {
-  for (const d of [P.home, P.logs, P.sessions, P.backups, P.proposed]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+  for (const d of [P.home, P.logs, P.sessions, P.backups, P.proposed, P.resources]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
   try { fs.chmodSync(P.home, 0o700); } catch {}
 }
 function appendJsonl(file, obj) { try { fs.appendFileSync(file, JSON.stringify(obj) + '\n'); } catch {} }
@@ -96,7 +101,11 @@ function loadConfig() {
   let user;
   try { user = JSON.parse(fs.readFileSync(P.config, 'utf8')); }
   catch (e) { throw new Error(`config is not valid JSON (${P.config}): ${e.message}`); }
-  return { ...DEFAULT_CONFIG, ...user };
+  // Add the dedicated task provider to existing configs without re-enabling
+  // providers or lanes that a user has intentionally customized.
+  const providers = { ...(user.providers || {}) };
+  if (!Object.prototype.hasOwnProperty.call(providers, 'manus')) providers.manus = { ...DEFAULT_CONFIG.providers.manus };
+  return { ...DEFAULT_CONFIG, ...user, providers };
 }
 function validateConfig(cfg) {
   const issues = [];
@@ -110,6 +119,7 @@ function validateConfig(cfg) {
     steps.forEach((s, i) => {
       if (!Array.isArray(s) || s.length !== 2) issues.push(`lane ${ln} step ${i + 1}: must be ["provider", "model"]`);
       else if (!cfg.providers[s[0]]) issues.push(`lane ${ln}: unknown provider "${s[0]}"`);
+      else if (cfg.providers[s[0]].type === 'manus') issues.push(`lane ${ln}: Manus is asynchronous and must be pinned directly, not added to a failover lane`);
     });
   }
   if (!(cfg.lanes && cfg.lanes[cfg.defaultLane])) issues.push(`defaultLane "${cfg.defaultLane}" is not a lane`);
@@ -146,7 +156,8 @@ async function probeProvider(cfg, name, timeoutMs = 8000) {
   if (!key) return { name, ok: false, error: `${p && p.keyEnv} is not set` };
   const t = Date.now();
   try {
-    const r = await fetch(p.url + '/models', { headers: { Authorization: 'Bearer ' + key }, signal: AbortSignal.timeout(timeoutMs) });
+    const manus = p.type === 'manus';
+    const r = await fetch(p.url + (manus ? '/v2/user.me' : '/models'), { headers: manus ? { 'x-manus-api-key': key } : { Authorization: 'Bearer ' + key }, signal: AbortSignal.timeout(timeoutMs) });
     const ms = Date.now() - t;
     if (r.ok) return { name, ok: true, status: r.status, ms };
     return { name, ok: false, status: r.status, ms, error: (await r.text()).slice(0, 4000) };

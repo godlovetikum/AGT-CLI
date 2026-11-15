@@ -146,11 +146,115 @@ function saveSession() {
   fs.writeFileSync(f + '.tmp', JSON.stringify(S)); fs.renameSync(f + '.tmp', f);
 }
 
+function copyMissingTree(from, to) {
+  if (!fs.existsSync(from)) return;
+  fs.mkdirSync(to, { recursive: true, mode: 0o700 });
+  for (const ent of fs.readdirSync(from, { withFileTypes: true })) {
+    if (ent.isSymbolicLink()) continue;
+    const src = path.join(from, ent.name), dst = path.join(to, ent.name);
+    if (ent.isDirectory()) copyMissingTree(src, dst);
+    else if (ent.isFile() && !fs.existsSync(dst)) fs.copyFileSync(src, dst);
+  }
+}
+function ensureManusResources() {
+  G.ensureDirs();
+  const packaged = path.join(__dirname, '..', 'resources');
+  copyMissingTree(packaged, P.resources);
+  const instructions = path.join(packaged, 'manus', 'AGT_INSTRUCTIONS.md');
+  if (!fs.existsSync(P.manusInstructions) && fs.existsSync(instructions)) fs.copyFileSync(instructions, P.manusInstructions);
+}
+function readManusInstructions() {
+  ensureManusResources();
+  try { return fs.readFileSync(P.manusInstructions, 'utf8').slice(0, 6000); } catch { return ''; }
+}
+const contextBlocked = p => {
+  const base = path.basename(p);
+  return (/^\.env/i.test(base) && !/\.example$/i.test(base))
+    || /^(id_rsa|id_ed25519|id_ecdsa|credentials?|secrets?|tokens?)(?:[._-]|$)/i.test(base)
+    || /\.(pem|key|p12|pfx)$/i.test(base);
+};
+const contextIgnoredDirs = new Set(['.git', '.agt', 'node_modules', '.venv', 'venv', 'dist', 'build', 'coverage', '.next', '.turbo', 'vendor']);
+function selectedContextPaths() {
+  const raw = String(process.env.AGT_MANUS_CONTEXT || 'tree').trim();
+  if (!raw || raw === 'tree') return null;
+  if (raw.toLowerCase() === 'none') return [];
+  return raw.split(/[,\n]/).map(s => s.trim().replace(/\\/g, '/')).filter(Boolean);
+}
+function buildProjectContext() {
+  const selected = selectedContextPaths();
+  const root = ROOT;
+  const tree = [];
+  let visited = 0;
+  const includePath = rel => !selected || selected.some(s => s === '.' || rel === s || rel.startsWith(s.replace(/\/$/, '') + '/') || s.startsWith(rel.replace(/\/$/, '') + '/'));
+  const walk = (dir, prefix = '') => {
+    if (visited >= 1000) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)); } catch { return; }
+    for (const ent of entries) {
+      if (visited >= 1000 || ent.isSymbolicLink() || contextBlocked(ent.name)) continue;
+      if (ent.isDirectory() && contextIgnoredDirs.has(ent.name)) continue;
+      const relPath = prefix ? prefix + '/' + ent.name : ent.name;
+      if (!includePath(relPath)) continue;
+      tree.push(relPath + (ent.isDirectory() ? '/' : ''));
+      visited++;
+      if (ent.isDirectory()) walk(path.join(dir, ent.name), relPath);
+    }
+  };
+  if (selected && selected.length === 0) return 'Directory tree omitted by AGT_MANUS_CONTEXT=none.';
+  walk(root);
+  let result = 'Directory tree (relative paths):\n' + (tree.join('\n') || '(empty or inaccessible)');
+  const files = String(process.env.AGT_MANUS_CONTEXT_FILES || '').split(/[,\n]/).map(s => s.trim()).filter(Boolean);
+  let chars = 0;
+  for (const item of files) {
+    const full = path.resolve(root, item);
+    const segments = item.replace(/\\/g, '/').split('/').filter(Boolean);
+    if (!T.isInside(root, full) || contextBlocked(item) || segments.some(s => contextIgnoredDirs.has(s))) continue;
+    try {
+      const lst = fs.lstatSync(full);
+      if (!lst.isFile() || lst.isSymbolicLink() || lst.size > 24000) continue;
+      if (!T.isInside(fs.realpathSync(root), fs.realpathSync(full))) continue;
+      const content = fs.readFileSync(full, 'utf8');
+      if (content.includes('\u0000')) continue;
+      const section = `\n\nSelected file ${path.relative(root, full).replace(/\\/g, '/')} (explicitly included):\n${content}`;
+      if (chars + section.length > 5000) break;
+      result += section; chars += section.length;
+    } catch {}
+  }
+  return result.slice(0, 7000);
+}
+function manusSeedHistory() {
+  if (!S || !S.messages.length) return '';
+  const rows = S.messages.slice(0, -1).map(m => {
+    if (m.role === 'user') return `USER: ${m.content || ''}`;
+    if (m.role === 'assistant') return `AGT ASSISTANT: ${m.content || ''}${(m.tool_calls || []).map(tc => `\nRequested local operation: ${tc.function.name} ${tc.function.arguments || ''}`).join('')}`;
+    if (m.role === 'tool') return `LOCAL OPERATION RESULT: ${m.content || ''}`;
+    return '';
+  }).filter(Boolean);
+  return rows.join('\n\n').slice(-3000);
+}
+function manusCurrentInput() {
+  const last = S && S.messages[S.messages.length - 1];
+  if (!last) return '';
+  if (last.role === 'user') return String(last.content || '');
+  if (last.role === 'tool') {
+    const prior = [...S.messages.slice(0, -1)].reverse().find(m => m.role === 'assistant' && (m.tool_calls || []).some(tc => tc.id === last.tool_call_id));
+    const call = prior && prior.tool_calls.find(tc => tc.id === last.tool_call_id);
+    return `Result from AGT local operation${call ? ` ${call.function.name} ${call.function.arguments}` : ''}:\n${last.content || ''}`;
+  }
+  return String(last.content || '');
+}
+function isManusTarget() {
+  const target = G.resolveTarget(CFG, model || lane);
+  return !!(target && target.steps.some(([name]) => CFG.providers[name] && CFG.providers[name].type === 'manus'));
+}
+
 // ================= file review =================
 const rel = full => path.relative(ROOT, full) || '.';
+const noGit = full => { if (path.relative(ROOT, full).split(path.sep).some(s => s.toLowerCase() === '.git')) throw new Error('.git is off limits'); };
 function safe(p) {
   const full = path.resolve(ROOT, p || '.');
   if (!T.isInside(ROOT, full)) throw new Error('path is outside the project folder');
+  noGit(full);
   let real = null;
   try { real = fs.realpathSync(full); } catch {}
   if (real) {
@@ -162,7 +266,6 @@ function safe(p) {
   if (/^\.env/i.test(base) && !/\.example$/i.test(base)) throw new Error('env files are blocked');
   return full;
 }
-const noGit = full => { if (path.relative(ROOT, full).split(path.sep).some(s => s.toLowerCase() === '.git')) throw new Error('.git is off limits'); };
 const colorDiff = l => (l.startsWith('+') && !l.startsWith('+++') ? c.green(l) : l.startsWith('-') && !l.startsWith('---') ? c.red(l) : l.startsWith('@@') ? c.cyan(l) : c.dim(l));
 
 function makeDiff(r, before, after) {
@@ -246,6 +349,23 @@ const clipForModel = s => {
   return s.slice(0, max) + `\n[clipped: showing ${max} of ${s.length} chars. Use start_line/end_line to read more.]`;
 };
 
+function safeResource(p) {
+  ensureManusResources();
+  const full = path.resolve(P.resources, p || '.');
+  if (!T.isInside(P.resources, full)) throw new Error('resource path is outside AGT resources');
+  const relPath = path.relative(P.resources, full);
+  let cursor = P.resources;
+  for (const part of relPath.split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, part);
+    if (fs.existsSync(cursor) && fs.lstatSync(cursor).isSymbolicLink()) throw new Error('symbolic links are not allowed in resources');
+  }
+  if (relPath.split(path.sep).some(contextBlocked)) throw new Error('secret-like resource files are blocked');
+  const rootReal = fs.realpathSync(P.resources);
+  const real = fs.existsSync(full) ? fs.realpathSync(full) : full;
+  if (!T.isInside(rootReal, real)) throw new Error('resource path resolves outside AGT resources');
+  return full;
+}
+
 const tools = {
   async list_dir({ path: p }) {
     const full = safe(p);
@@ -261,6 +381,22 @@ const tools = {
     const total = t.split('\n').length;
     if (start_line || end_line) t = t.split('\n').slice((start_line || 1) - 1, end_line || undefined).join('\n');
     out(`${c.cyan('▸')} read_file ${c.bold(rel(full))} ${c.dim(total + ' lines, ' + G.bytes(Buffer.byteLength(t)) + (start_line || end_line ? `, range ${start_line || 1}-${end_line || total}` : ''))}`);
+    return t;
+  },
+  async list_resources({ path: p }) {
+    const full = safeResource(p);
+    if (!fs.statSync(full).isDirectory()) throw new Error('resource path is not a directory');
+    const items = fs.readdirSync(full, { withFileTypes: true }).filter(d => !d.isSymbolicLink() && !contextBlocked(d.name)).map(d => path.posix.join(path.relative(P.resources, path.join(full, d.name)).split(path.sep).join('/'), d.isDirectory() ? '' : '') + (d.isDirectory() ? '/' : ''));
+    out(`${c.cyan('▸')} list_resources ${c.bold(path.relative(P.resources, full) || '.')} ${c.dim(items.length + ' entries')}`);
+    return items.join('\n') || '(empty)';
+  },
+  async read_resource({ path: p }) {
+    const full = safeResource(p);
+    if (fs.statSync(full).isDirectory()) throw new Error('resource path is a directory. Use list_resources.');
+    if (fs.statSync(full).size > 1e6) throw new Error('resource is too large to send to the model (maximum 1 MB)');
+    const t = fs.readFileSync(full, 'utf8');
+    if (t.includes('\u0000')) throw new Error('binary resource, not readable as text');
+    out(`${c.cyan('▸')} read_resource ${c.bold(path.relative(P.resources, full))} ${c.dim(G.bytes(Buffer.byteLength(t)))}`);
     return t;
   },
   async write_file({ path: p, content }) {
@@ -315,6 +451,8 @@ const STR = { type: 'string' }, INT = { type: 'integer' };
 const TOOLS = [
   tool('list_dir', 'List files in a project directory', { path: STR }, []),
   tool('read_file', 'Read a text file; optional line range', { path: STR, start_line: INT, end_line: INT }, ['path']),
+  tool('list_resources', 'List user-editable AGT reference resources (not project files)', { path: STR }, []),
+  tool('read_resource', 'Read a user-editable AGT reference resource by path under the private resources directory', { path: STR }, ['path']),
   tool('write_file', 'Create or overwrite a file with full content', { path: STR, content: STR }, ['path', 'content']),
   tool('edit_file', 'Replace one exact, unique snippet in a file', { path: STR, old_str: STR, new_str: STR }, ['path', 'old_str', 'new_str']),
   tool('run_command', 'Run a shell command in the project root', { command: STR }, ['command']),
@@ -328,7 +466,7 @@ function buildSystem() {
     const fp = path.join(ROOT, f);
     if (fs.existsSync(fp)) ctx += `\n\nProject notes (${f}):\n` + fs.readFileSync(fp, 'utf8').slice(0, CFG.maxToolChars);
   }
-  return `You are a careful coding agent working in ${ROOT}, on ${G.platformName()}. Shell commands run with ${process.platform === 'win32' ? 'cmd.exe' : 'sh'}. Inspect files with your tools before changing anything. Prefer edit_file with a small unique snippet over rewriting whole files. The user reviews every file change and command before it runs; if one is denied, read the reason and adjust. Tool output may be clipped: read large files in line ranges. Never read or print secrets or env files. Keep replies short and say what you changed.` + ctx;
+  return `You are a careful coding agent working in ${ROOT}, on ${G.platformName()}. Shell commands run with ${process.platform === 'win32' ? 'cmd.exe' : 'sh'}. Inspect files with your tools before changing anything. Prefer edit_file with a small unique snippet over rewriting whole files. The user reviews every file change and command before it runs; if one is denied, read the reason and adjust. Tool output may be clipped: read large files in line ranges. Never read or print secrets or env files. Reference materials under AGT's private resources directory are available only through list_resources/read_resource. Keep replies short and say what you changed.` + ctx;
 }
 function prettyErr(text) {
   try {
@@ -340,18 +478,56 @@ function prettyErr(text) {
 }
 async function callModel(signal) {
   const t0 = Date.now();
-  const r = await fetch(base() + '/v1/chat/completions', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, signal,
-    body: JSON.stringify({ model: model || lane, messages: [{ role: 'system', content: SYSTEM }, ...S.messages], tools: TOOLS }),
-  });
+  const selected = model || lane;
+  const target = G.resolveTarget(CFG, selected);
+  const usesManus = !!(target && target.steps.some(([name]) => CFG.providers[name] && CFG.providers[name].type === 'manus'));
+  if (S.manusTarget && S.manusTarget !== selected) { S.manusTaskId = null; S.manusUserId = null; }
+  S.manusTarget = selected;
+  const requestBody = { model: selected, messages: [{ role: 'system', content: SYSTEM }, ...S.messages], tools: TOOLS };
+  if (usesManus) {
+    requestBody.manus = {
+      task_id: S.manusTaskId || null,
+      user_id: S.manusUserId || null,
+      input: manusCurrentInput(),
+      system_context: SYSTEM,
+      instructions: readManusInstructions(),
+      project_context: buildProjectContext(),
+      seed_history: manusSeedHistory(),
+    };
+  } else {
+    S.manusTaskId = null; S.manusUserId = null;
+  }
+  let r;
+  try {
+    r = await fetch(base() + '/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal,
+      body: JSON.stringify(requestBody),
+    });
+  } catch (e) {
+    if (usesManus && signal && signal.aborted) {
+      S.manusTaskId = null; S.manusUserId = null; e.manusTimeout = true;
+    }
+    throw e;
+  }
   const text = await r.text();
   const via = r.headers.get('x-router-via'), rid = r.headers.get('x-router-id');
-  if (!r.ok) { const e = new Error(`router returned HTTP ${r.status}` + (rid ? ` (request ${rid})` : '')); e.detail = prettyErr(text); throw e; }
+  if (!r.ok) {
+    let manusTimeout = false;
+    try {
+      const errorData = JSON.parse(text);
+      if (errorData.manus_task_id) {
+        // The remote task may still be running. Keep the user turn in local history,
+        // but do not send another message into an in-flight/ambiguous remote task.
+        S.manusTaskId = null; S.manusUserId = null; manusTimeout = true;
+      }
+    } catch {}
+    const e = new Error(`router returned HTTP ${r.status}` + (rid ? ` (request ${rid})` : '')); e.detail = prettyErr(text); e.manusTimeout = manusTimeout; throw e;
+  }
   let data; try { data = JSON.parse(text); } catch { throw new Error('router sent invalid JSON:\n' + text); }
   const ch = data.choices && data.choices[0];
   if (!ch) throw new Error('response had no choices:\n' + text);
   const { reasoning, reasoning_content, annotations, refusal, ...msg } = ch.message;
-  return { msg, usage: data.usage || {}, via, rid, ms: Date.now() - t0, finish: ch.finish_reason };
+  return { msg, usage: data.usage || {}, via, rid, ms: Date.now() - t0, finish: ch.finish_reason, manus_task_id: data.manus_task_id, manus_user_id: data.manus_user_id };
 }
 async function execTool(tc) {
   const name = tc.function.name;
@@ -383,6 +559,8 @@ async function runTurn(text) {
       let r;
       try { r = await callModel(ctl.signal); } finally { ctl = null; think(false); }
       const { msg, usage } = r;
+      if (r.manus_task_id) S.manusTaskId = r.manus_task_id;
+      if (r.manus_user_id) S.manusUserId = r.manus_user_id;
       for (const tc of msg.tool_calls || []) tc.id = tc.id || 'call_' + rand(4);
       S.messages.push(msg);
       S.usage.prompt += usage.prompt_tokens || 0; S.usage.completion += usage.completion_tokens || 0;
@@ -406,7 +584,7 @@ async function runTurn(text) {
       out(c.dim('  /log shows router details · agt doctor diagnoses'));
       lg('error', 'turn_failed', { error: e.message, detail: e.detail });
     }
-    if (S.messages.length === mark + 1) S.messages.length = mark;
+    if (S.messages.length === mark + 1 && !e.manusTimeout) S.messages.length = mark;
   }
   flush(); saveSession();
 }
@@ -497,7 +675,10 @@ async function cmdChat(pos, flags, resume) {
   try { rs = await startRouter(); } catch (e) { out(`${sym.fail} ${e.message}`); return 1; }
   const startedRouter = !!rs.started, h = rs.health;
   out(`${c.bold('router')} ${dot(h.status)} ${c.dim('· providers: ' + (h.providers.filter(p => p.configured).map(p => p.name).join(', ') || 'NONE'))}${startedRouter ? c.dim(' · just started') : ''}`);
-  if (h.status === 'down') out(`${sym.warn} no provider can serve requests. Run: agt doctor`);
+  if (h.status === 'down') {
+    if (isManusTarget() && G.keyOf(CFG, 'manus')) out(`${sym.warn} no synchronous lane provider is ready; the selected Manus task provider remains available.`);
+    else out(`${sym.warn} no provider can serve requests. Run: agt doctor`);
+  }
 
   if (resume) {
     S = findSession(resume === true ? null : resume, ROOT);
@@ -551,7 +732,7 @@ async function cmdChat(pos, flags, resume) {
 }
 
 // ================= keys & setup =================
-const KEY_URLS = { gemini: 'https://aistudio.google.com/apikey', groq: 'https://console.groq.com/keys', cerebras: 'https://cloud.cerebras.ai', openrouter: 'https://openrouter.ai/keys' };
+const KEY_URLS = { manus: 'https://manus.im/app/developers', gemini: 'https://aistudio.google.com/apikey', groq: 'https://console.groq.com/keys', cerebras: 'https://cloud.cerebras.ai', openrouter: 'https://openrouter.ai/keys' };
 
 // Reads a secret without echoing it. With piped input (or forceLine) it just reads one line.
 function readSecret(prompt, forceLine = false) {
@@ -614,6 +795,8 @@ async function cmdKeys(pos, flags) {
     try { K.saveKey(t.name, value); } catch (e) { out(`${sym.fail} ${e.message}`); return 1; }
     process.env[t.name] = value;
     out(`${sym.ok} saved ${t.name} to ${P.keys}`);
+    const reload = await rget('/admin/reload', { method: 'POST' });
+    if (reload && reload.ok) out(c.dim('  running router reloaded its key and config'));
     if (t.provider && !flags['no-test']) {
       const r = await G.probeProvider(CFG, t.provider);
       out(r.ok ? `${sym.ok} ${t.provider} accepted the key (${r.ms}ms)` : `${sym.warn} ${t.provider} said: ${r.status ? 'HTTP ' + r.status + ' ' : ''}${r.error}`);
@@ -644,6 +827,10 @@ async function cmdSetup() {
     process.env[p.keyEnv] = v; added++;
     const r = await G.probeProvider(CFG, name);
     out(r.ok ? `  ${sym.ok} saved, and ${name} accepted it (${r.ms}ms)` : `  ${sym.warn} saved, but ${name} said: ${r.status ? 'HTTP ' + r.status + ' ' : ''}${r.error}`);
+  }
+  if (added) {
+    const reload = await rget('/admin/reload', { method: 'POST' });
+    if (reload && reload.ok) out(c.dim('  running router reloaded its keys and config'));
   }
   out(`\n${added ? 'Done.' : 'Nothing changed.'} Next: ${c.bold('agt doctor')}, then ${c.bold('agt')} inside a project folder.`);
   return 0;
@@ -683,6 +870,7 @@ async function cmdUpdate(pos, flags) {
 async function listModels(name) {
   const p = CFG.providers[name], key = G.keyOf(CFG, name);
   if (!key) return { error: `${p.keyEnv} is not set` };
+  if (p.type === 'manus') return { ids: ['agent'] };
   try {
     const r = await fetch(p.url + '/models', { headers: { Authorization: 'Bearer ' + key }, signal: AbortSignal.timeout(10000) });
     const text = await r.text();
@@ -732,6 +920,7 @@ async function compact() {
   const before = JSON.stringify(S.messages).length;
   saveSession();
   fs.writeFileSync(path.join(P.sessions, `${S.id}.${Date.now()}.precompact.bak`), JSON.stringify(S));
+  S.manusTaskId = null; S.manusUserId = null;
   S.messages = [
     { role: 'user', content: 'Summary of our work so far (older messages were compacted to save tokens):\n' + summary },
     { role: 'assistant', content: 'Understood. I have the summary and can continue from here.' },
@@ -796,6 +985,12 @@ async function cmdConfig(pos) {
   if (CFG_ERR) { out(`${sym.fail} ${CFG_ERR.message}`); return 1; }
   out(JSON.stringify(CFG, null, 2));
   for (const i of G.validateConfig(CFG)) out(`${sym.warn} ${i}`);
+  return 0;
+}
+function cmdResources() {
+  ensureManusResources();
+  out(c.bold('Editable Manus resources') + `\n  integration instructions: ${P.manusInstructions}\n  project knowledge and reusable skills: ${P.resources}`);
+  out(c.dim('Edit these Markdown files with your editor. Manus can list and read resources when relevant; they are not sent on every turn.'));
   return 0;
 }
 function cmdSessions(pos) {
@@ -920,6 +1115,7 @@ const COMMANDS = {
   changes: { desc: 'what the agent changed or tried to', usage: 'agt changes [-n 15]', run: cmdChanges },
   undo: { desc: 'restore a file the agent changed', usage: 'agt undo [change-id] [--force]', run: cmdUndo },
   config: { desc: 'view or edit lanes, aliases, providers and limits', usage: 'agt config [show|path|edit]', run: cmdConfig },
+  resources: { desc: 'show editable Manus instructions, project knowledge and skills', usage: 'agt resources', run: cmdResources },
   update: { desc: 'update to the latest version', usage: 'agt update [--check]', run: cmdUpdate },
   help: { desc: 'this help', usage: 'agt help [command]', run: cmdHelp },
   version: { desc: 'print the version', usage: 'agt version', run: () => { out('agt ' + G.VERSION); return 0; } },

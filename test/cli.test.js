@@ -14,7 +14,7 @@ test('version, help and unknown commands', async () => {
   assert.match(cli(['--version'], s.env).stdout, new RegExp('^agt ' + VERSION.replace(/\./g, '\\.')));
   const h = cli(['help'], s.env);
   assert.strictEqual(h.status, 0);
-  for (const w of ['chat', 'doctor', 'router', 'undo', 'config']) assert.match(h.stdout, new RegExp(w));
+  for (const w of ['chat', 'doctor', 'router', 'undo', 'config', 'resources']) assert.match(h.stdout, new RegExp(w));
   assert.match(cli(['help', 'undo'], s.env).stdout, /restore a file/);
   const bad = cli(['nonsense'], s.env);
   assert.strictEqual(bad.status, 1);
@@ -28,6 +28,9 @@ test('first run creates the data folder and a default config', () => {
   assert.strictEqual(r.status, 0);
   const cfg = JSON.parse(fs.readFileSync(path.join(home, 'data', 'config.json'), 'utf8'));
   assert.strictEqual(cfg.defaultLane, 'edit');
+  assert.strictEqual(cfg.providers.manus.type, 'manus');
+  assert.strictEqual(cfg.providers.manus.keyEnv, 'MANUS_API_KEY');
+  assert.strictEqual(cfg.manusTimeoutSec, 600);
   assert.deepStrictEqual(cfg.lanes.edit[0], ['groq', 'openai/gpt-oss-120b']);
   assert.ok(!JSON.stringify(cfg.lanes.edit).includes('qwen'), 'qwen was removed from the edit lane');
 });
@@ -83,6 +86,8 @@ test('config validation catches bad lanes and providers', async () => {
   assert.ok(issues.some(i => /missing "keyEnv"/.test(i)));
   assert.ok(issues.some(i => /unknown provider "nope"/.test(i)));
   assert.ok(issues.some(i => /lane y: must be a non-empty list/.test(i)));
+  const manusLane = G.validateConfig({ defaultLane: 'x', providers: { manus: { type: 'manus', url: 'u', keyEnv: 'M' } }, lanes: { x: [['manus', 'agent']] } });
+  assert.ok(manusLane.some(i => /Manus is asynchronous/.test(i)));
 });
 
 test('router start / health / stop lifecycle through the CLI', async t => {

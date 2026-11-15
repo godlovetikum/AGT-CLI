@@ -22,7 +22,7 @@ test('npm pack contains what users need and none of what they do not', { skip: !
   assert.strictEqual(r.status, 0, r.stderr);
   const info = JSON.parse(r.stdout)[0];
   const files = info.files.map(f => f.path.replace(/\\/g, '/'));
-  for (const need of ['package.json', 'README.md', 'LICENSE', 'bin/agt.js', 'src/cli.js', 'src/router.js', 'src/common.js', 'src/keys.js', 'src/textutil.js', 'scripts/postinstall.js'])
+  for (const need of ['package.json', 'README.md', 'LICENSE', 'bin/agt.js', 'src/cli.js', 'src/router.js', 'src/common.js', 'src/keys.js', 'src/manus.js', 'src/textutil.js', 'resources/manus/AGT_INSTRUCTIONS.md', 'resources/templates/PROJECT_KNOWLEDGE.md', 'resources/skills/testing-debugging.md', 'docs/MANUS.md', 'scripts/postinstall.js'])
     assert.ok(files.includes(need), `missing ${need}`);
   for (const bad of files.filter(f => /^(test|\.github|\.git|node_modules)\//.test(f) || f === 'install.js'))
     assert.fail(`should not be published: ${bad}`);
@@ -46,6 +46,11 @@ test('installing the tarball gives working agt and agt-cli commands', { skip: !a
   }
   const help = spawnSync(bin('agt'), ['help'], { encoding: 'utf8', env, shell: WIN, timeout: 30000 });
   for (const word of ['setup', 'models', 'update', 'doctor']) assert.match(help.stdout, new RegExp(word));
+  const resources = spawnSync(bin('agt'), ['resources'], { encoding: 'utf8', env, shell: WIN, timeout: 30000 });
+  assert.strictEqual(resources.status, 0, resources.stdout + resources.stderr);
+  assert.ok(fs.existsSync(path.join(env.AGT_HOME, 'manus-instructions.md')));
+  assert.ok(fs.existsSync(path.join(env.AGT_HOME, 'resources', 'templates', 'PROJECT_KNOWLEDGE.md')));
+  assert.ok(fs.existsSync(path.join(env.AGT_HOME, 'resources', 'skills', 'testing-debugging.md')));
   const doc = spawnSync(bin('agt'), ['doctor'], { encoding: 'utf8', env, shell: WIN, timeout: 30000 });
   assert.strictEqual(doc.status, 0, doc.stdout + doc.stderr);
   assert.match(doc.stdout, /0 problems/);

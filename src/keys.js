@@ -5,6 +5,7 @@ const fs = require('fs');
 const { P } = require('./common');
 
 const SOURCE = {}; // VARIABLE_NAME -> 'keys file', for values this module loaded
+const FILE_KEYS = new Set();
 
 function parse(text) {
   const out = {};
@@ -26,8 +27,12 @@ function readFile() { try { return parse(fs.readFileSync(P.keys, 'utf8')); } cat
 
 function loadKeys() {
   const vals = readFile();
+  for (const k of FILE_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(vals, k) && SOURCE[k] === 'keys file') { delete process.env[k]; delete SOURCE[k]; }
+  }
+  FILE_KEYS.clear();
   for (const [k, v] of Object.entries(vals)) {
-    if (v && !process.env[k]) { process.env[k] = v; SOURCE[k] = 'keys file'; }
+    if (v && (!process.env[k] || SOURCE[k] === 'keys file')) { process.env[k] = v; SOURCE[k] = 'keys file'; FILE_KEYS.add(k); }
   }
   return vals;
 }
@@ -50,6 +55,7 @@ function saveKey(name, value) {
   const ls = dropVar(lines() || ['# agt API keys. One NAME="value" per line. Keep this file private.'], name);
   ls.push(`${name}="${value}"`);
   write(ls);
+  SOURCE[name] = 'keys file'; FILE_KEYS.add(name);
 }
 
 function removeKey(name) {
@@ -58,6 +64,7 @@ function removeKey(name) {
   const next = dropVar(ls, name);
   if (next.length === ls.length) return false;
   write(next);
+  if (SOURCE[name] === 'keys file') { delete process.env[name]; delete SOURCE[name]; FILE_KEYS.delete(name); }
   return true;
 }
 

@@ -2,6 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs'), os = require('os'), path = require('path');
+const { spawnSync } = require('child_process');
 const { setup, cli, mockProvider, cliAsync } = require('./helpers');
 
 const LANES = { edit: [['a', 'model-a']] };
@@ -44,6 +45,26 @@ test('real environment variables win over the keys file', async () => {
   fs.writeFileSync(path.join(s.home, 'keys.env'), 'A_KEY="from-file"\n');
   const r = cli(['keys', 'list'], { ...s.env, A_KEY: 'from-env' });
   assert.match(r.stdout, /A_KEY · 8 chars · from environment/);
+});
+
+test('keys reload updates and removes values loaded from the private file', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agt-key-reload-'));
+  const script = `
+    const fs = require('fs'), path = require('path');
+    const K = require(${JSON.stringify(path.join(__dirname, '..', 'src', 'keys.js'))});
+    const file = path.join(process.env.AGT_HOME, 'keys.env');
+    fs.writeFileSync(file, 'MANUS_API_KEY="first"\\n');
+    K.loadKeys();
+    if (process.env.MANUS_API_KEY !== 'first') throw new Error('first load failed');
+    fs.writeFileSync(file, 'MANUS_API_KEY="second"\\n');
+    K.loadKeys();
+    if (process.env.MANUS_API_KEY !== 'second') throw new Error('replacement was not loaded');
+    fs.writeFileSync(file, '');
+    K.loadKeys();
+    if (process.env.MANUS_API_KEY) throw new Error('removed file key is still loaded');
+  `;
+  const r = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', env: { ...process.env, AGT_HOME: home, MANUS_API_KEY: '' } });
+  assert.strictEqual(r.status, 0, r.stdout + r.stderr);
 });
 
 test('keys with spaces, quotes or nothing at all are refused', async () => {

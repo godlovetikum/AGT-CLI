@@ -1,10 +1,12 @@
 'use strict';
 const http = require('http'), fs = require('fs');
 const G = require('./common');
+const Manus = require('./manus');
 const { P } = G;
 
 G.ensureDirs();
-require('./keys').loadKeys();
+const K = require('./keys');
+K.loadKeys();
 G.rotate(P.routerLog);
 let CFG;
 try { CFG = G.loadConfig(); } catch (e) { console.error(e.message); process.exit(2); }
@@ -106,6 +108,37 @@ async function handleChat(req, res) {
     log('error', 'no_providers', { id: rid, lane, need });
     return send(res, 503, { error: { message: `"${lane}" has no usable provider. Set: ${need}` } }, { 'x-router-id': rid });
   }
+  if (pinned && CFG.providers[usable[0][0]].type === 'manus') {
+    const [provider, modelId] = usable[0];
+    const t0 = Date.now();
+    const ctl = new AbortController();
+    res.on('close', () => { if (!res.writableEnded) ctl.abort(); });
+    try {
+      const completion = await Manus.run({
+        provider: CFG.providers[provider], key: G.keyOf(CFG, provider), body,
+        signal: ctl.signal,
+        timeoutMs: (CFG.manusTimeoutSec || 600) * 1000,
+        pollMs: Math.max(1000, CFG.manusPollMs || 2000),
+      });
+      bump(provider + '/' + modelId, 'ok');
+      log('info', 'request', { id: rid, lane, via: provider + '/' + modelId, status: 200, ms: Date.now() - t0, transport: 'manus-task', tool_calls: completion.choices[0].message.tool_calls ? 1 : 0 });
+      return send(res, 200, completion, {
+        'x-router-id': rid, 'x-router-lane': lane, 'x-router-via': provider + '/' + modelId,
+        'x-manus-task-id': completion.manus_task_id || '', 'x-manus-user-id': completion.manus_user_id || '',
+      });
+    } catch (e) {
+      if (ctl.signal.aborted) { log('info', 'client_aborted', { id: rid, lane, via: provider + '/' + modelId }); return; }
+      bump(provider + '/' + modelId, 'fail');
+      log('warn', 'attempt_failed', { id: rid, lane, via: provider + '/' + modelId, status: e.status || 0, ms: Date.now() - t0, error: e.message });
+      return send(res, e.status && e.status >= 400 && e.status < 500 ? e.status : 502, {
+        error: { message: e.message },
+        ...(e.manusTaskId ? { manus_task_id: e.manusTaskId, manus_user_id: e.manusUserId } : {}),
+      }, { 'x-router-id': rid, 'x-router-via': provider + '/' + modelId, ...(e.manusTaskId ? { 'x-manus-task-id': e.manusTaskId, 'x-manus-user-id': e.manusUserId || '' } : {}) });
+    }
+  }
+  if (!pinned && usable.some(([name]) => CFG.providers[name] && CFG.providers[name].type === 'manus')) {
+    return send(res, 400, { error: { message: 'Manus is an asynchronous task provider and cannot be used in a failover lane. Pin it directly with /model manus/agent.' } }, { 'x-router-id': rid });
+  }
   let steps = pinned ? usable : usable.filter(([p, m]) => !(cooling[p + '/' + m] > Date.now()));
   if (!steps.length) steps = usable; // everything parked: try anyway
 
@@ -181,7 +214,7 @@ const server = http.createServer(async (req, res) => {
       case 'POST /chat/completions': return handleChat(req, res);
       case 'POST /admin/reset': for (const k of Object.keys(cooling)) delete cooling[k]; log('info', 'cooldowns_reset'); return send(res, 200, { ok: true });
       case 'POST /admin/reload':
-        try { CFG = G.loadConfig(); log('info', 'config_reloaded'); return send(res, 200, { ok: true, issues: G.validateConfig(CFG) }); }
+        try { K.loadKeys(); CFG = G.loadConfig(); log('info', 'config_reloaded'); return send(res, 200, { ok: true, issues: G.validateConfig(CFG) }); }
         catch (e) { return send(res, 400, { ok: false, error: e.message }); }
       case 'POST /admin/shutdown': send(res, 200, { ok: true }); return setTimeout(() => shutdown(0), 100);
       default: return send(res, 404, { error: { message: 'not found', routes: ['GET /health[?deep=1]', 'GET /stats', 'GET /config', 'GET /v1/models', 'POST /v1/chat/completions', 'POST /admin/reset|reload|shutdown'] } });
