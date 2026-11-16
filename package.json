@@ -1,6 +1,6 @@
 {
   "name": "agt-cli",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "agt: a terminal coding agent with failover across OpenAI-compatible providers and a Manus task bridge for local projects. File edits and commands require approval. Zero dependencies. Windows, macOS, Linux and Android (Termux).",
   "license": "MIT",
   "bin": { "agt": "bin/agt.js", "agt-cli": "bin/agt.js" },

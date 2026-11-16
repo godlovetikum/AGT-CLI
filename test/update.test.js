@@ -40,6 +40,17 @@ test('agt update says so when already current, and when this copy is not an npm 
   assert.match(r.stdout, /npm install -g agt-cli@latest/);
 });
 
+test('update comparison handles prerelease precedence instead of ignoring suffixes', async t => {
+  const sameCorePrerelease = await registry(VERSION + '-beta.9');
+  const greaterPrerelease = await registry('1.2.1-beta.1');
+  t.after(() => Promise.all([sameCorePrerelease.close(), greaterPrerelease.close()]));
+  const s = await setup({ a: { url: 'http://127.0.0.1:1', keyEnv: 'A_KEY' } }, LANES);
+  const old = await cliAsync(['update', '--check'], { ...s.env, AGT_REGISTRY: sameCorePrerelease.url });
+  assert.match(old.stdout, /already up to date/);
+  const newer = await cliAsync(['update', '--check'], { ...s.env, AGT_REGISTRY: greaterPrerelease.url });
+  assert.match(newer.stdout, /update available: 1\.2\.1-beta\.1/);
+});
+
 test('agt update fails clearly when the registry cannot be reached', async () => {
   const s = await setup({ a: { url: 'http://127.0.0.1:1', keyEnv: 'A_KEY' } }, LANES);
   const r = await cliAsync(['update', '--check'], { ...s.env, AGT_REGISTRY: 'http://127.0.0.1:1' });

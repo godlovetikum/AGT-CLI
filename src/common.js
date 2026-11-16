@@ -1,5 +1,6 @@
 'use strict';
 const fs = require('fs'), path = require('path'), os = require('os');
+const { isInside } = require('./textutil');
 
 const VERSION = require('../package.json').version;
 // Data folder: AGT_HOME (or the older AG_HOME) wins; otherwise ~/.agt, or the earlier ~/.ag when that
@@ -83,23 +84,90 @@ function formatLog(r) {
 
 // ---------- files ----------
 function ensureDirs() {
-  for (const d of [P.home, P.logs, P.sessions, P.backups, P.proposed, P.resources]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(P.home, 0o700); } catch {}
+  fs.mkdirSync(P.home, { recursive: true, mode: 0o700 });
+  const homeStat = fs.lstatSync(P.home);
+  if (!homeStat.isDirectory() && !homeStat.isSymbolicLink()) throw new Error(`AGT data path is not a directory: ${P.home}`);
+  const homeReal = fs.realpathSync(P.home);
+  if (!homeStat.isSymbolicLink()) try { fs.chmodSync(P.home, 0o700); } catch {}
+  for (const d of [P.logs, P.sessions, P.backups, P.proposed, P.resources]) {
+    fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+    const st = fs.lstatSync(d);
+    if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`AGT private directory must not be a symlink: ${d}`);
+    const real = fs.realpathSync(d);
+    if (!isInside(homeReal, real)) throw new Error(`AGT private directory resolves outside the data folder: ${d}`);
+    try { fs.chmodSync(d, 0o700); } catch {}
+  }
 }
-function appendJsonl(file, obj) { try { fs.appendFileSync(file, JSON.stringify(obj) + '\n'); } catch {} }
+function privateFilePath(file) {
+  const abs = path.resolve(file), homePath = path.resolve(P.home);
+  if (!isInside(homePath, abs) || abs === homePath) throw new Error('AGT file path is outside the private data folder');
+  const homeReal = fs.realpathSync(P.home);
+  let cursor = homePath, nearest = homePath;
+  const parts = path.relative(homePath, abs).split(path.sep).filter(Boolean);
+  for (let i = 0; i < parts.length; i++) {
+    cursor = path.join(cursor, parts[i]);
+    let st;
+    try { st = fs.lstatSync(cursor); }
+    catch (e) { if (e.code === 'ENOENT') break; throw e; }
+    if (st.isSymbolicLink()) throw new Error(`AGT private file cannot be a symlink: ${cursor}`);
+    if (i < parts.length - 1 && !st.isDirectory()) throw new Error(`AGT file parent is not a directory: ${cursor}`);
+    nearest = cursor;
+  }
+  if (!isInside(homeReal, fs.realpathSync(nearest))) throw new Error('AGT file resolves outside the private data folder');
+  return abs;
+}
+function readPrivateFile(file, encoding = 'utf8') {
+  const abs = privateFilePath(file);
+  const st = fs.lstatSync(abs);
+  if (!st.isFile()) throw new Error(`AGT private path is not a regular file: ${abs}`);
+  return fs.readFileSync(abs, encoding);
+}
+function writePrivateFile(file, content, mode = 0o600) {
+  const abs = privateFilePath(file);
+  const parent = path.dirname(abs);
+  if (!fs.existsSync(parent)) throw new Error(`AGT private directory does not exist: ${parent}`);
+  const tmp = `${abs}.${process.pid}.${require('crypto').randomBytes(8).toString('hex')}.tmp`;
+  let fd;
+  try {
+    fd = fs.openSync(tmp, 'wx', mode);
+    fs.writeFileSync(fd, content);
+    try { fs.fchmodSync(fd, mode); } catch {}
+    fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = undefined;
+    privateFilePath(abs);
+    fs.renameSync(tmp, abs);
+  } catch (e) {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    throw e;
+  }
+}
+function openPrivateAppend(file) {
+  const abs = privateFilePath(file);
+  const flags = fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW || 0);
+  const fd = fs.openSync(abs, flags, 0o600);
+  if (!fs.fstatSync(fd).isFile()) { fs.closeSync(fd); throw new Error(`AGT log is not a regular file: ${abs}`); }
+  return fd;
+}
+function appendJsonl(file, obj) {
+  let fd;
+  try { fd = openPrivateAppend(file); fs.writeSync(fd, JSON.stringify(obj) + '\n'); }
+  catch {} finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
+}
 function readJsonl(file) {
-  try { return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
+  try { return readPrivateFile(file).split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
   catch { return []; }
 }
-function tailFile(file, n) { try { return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).slice(-n); } catch { return []; } }
-function rotate(file, max = 2e6) { try { if (fs.statSync(file).size > max) fs.renameSync(file, file + '.1'); } catch {} }
+function tailFile(file, n) { try { return readPrivateFile(file).split('\n').filter(Boolean).slice(-n); } catch { return []; } }
+function rotate(file, max = 2e6) { try { const abs = privateFilePath(file), st = fs.lstatSync(abs); if (!st.isFile()) return; if (st.size > max) fs.renameSync(abs, abs + '.1'); } catch {} }
 
 // ---------- config ----------
 function loadConfig() {
   ensureDirs();
-  if (!fs.existsSync(P.config)) fs.writeFileSync(P.config, JSON.stringify(DEFAULT_CONFIG, null, 2) + '\n');
+  privateFilePath(P.config);
+  if (!fs.existsSync(P.config)) writePrivateFile(P.config, JSON.stringify(DEFAULT_CONFIG, null, 2) + '\n');
   let user;
-  try { user = JSON.parse(fs.readFileSync(P.config, 'utf8')); }
+  try { user = JSON.parse(readPrivateFile(P.config)); }
   catch (e) { throw new Error(`config is not valid JSON (${P.config}): ${e.message}`); }
   // Add the dedicated task provider to existing configs without re-enabling
   // providers or lanes that a user has intentionally customized.
@@ -166,4 +234,4 @@ async function probeProvider(cfg, name, timeoutMs = 8000) {
   }
 }
 
-module.exports = { VERSION, P, DEFAULT_CONFIG, resolveTarget, isTermux, platformName, installHint, c, sym, dur, bytes, ago, formatLog, ensureDirs, appendJsonl, readJsonl, tailFile, rotate, loadConfig, validateConfig, keyOf, probeProvider };
+module.exports = { VERSION, P, DEFAULT_CONFIG, resolveTarget, isTermux, platformName, installHint, c, sym, dur, bytes, ago, formatLog, ensureDirs, privateFilePath, readPrivateFile, writePrivateFile, openPrivateAppend, appendJsonl, readJsonl, tailFile, rotate, loadConfig, validateConfig, keyOf, probeProvider };

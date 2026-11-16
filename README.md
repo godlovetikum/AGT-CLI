@@ -25,8 +25,10 @@ npm install -g agt-cli
 Install straight from GitHub (before a release, or to test a branch):
 
 ```
-npm install -g github:godlovetikum/agt-cli
+npm install -g 'github:godlovetikum/agt-cli#dev'
 ```
+
+This updates the installed CLI in the same npm prefix when the branch has a newer package version; AGT's separate `~/.agt` data folder is not replaced. Remove `#dev` to install the repository's default branch instead.
 
 Offline or from a zip: unzip it, `cd` into the folder, run `npm install -g .`
 
@@ -62,7 +64,7 @@ Or at start: `agt --model fast`, `agt --lane plan`.
 
 ## Commands
 
-`agt help` lists everything. The main ones:
+`agt help` lists every command and its syntax. Use `agt help <command>` or `agt <command> --help` for details.
 
 | Command | What it does |
 |---|---|
@@ -72,8 +74,9 @@ Or at start: `agt --model fast`, `agt --lane plan`.
 | `agt doctor` | Diagnose setup, keys, router, updates |
 | `agt router start\|stop\|restart\|status\|reset` | Control the local router |
 | `agt health [--deep]` | Router health (`--deep` tests each key live) |
-| `agt stats`, `agt logs [-f]` | Usage per provider, readable logs |
-| `agt sessions`, `agt show <id>` | Saved chats |
+| `agt stats`, `agt logs [-f]` | Usage per provider (offline snapshot supported), readable logs |
+| `agt sessions`, `agt sessions rm <id>`, `agt show <id>` | List, inspect, or delete local chats |
+| `agt tasks [list|show|resume|stop|delete]` | Manage remote Manus account tasks |
 | `agt changes`, `agt undo` | What the agent changed, and undo it |
 | `agt config [edit]` | View or edit lanes, aliases, providers, limits |
 | `agt update` | Update to the latest version |
@@ -84,9 +87,9 @@ In chat, `/help` shows the slash commands (`/compact` shrinks a long chat to sav
 
 - File changes and commands need your approval; commands show risk warnings (deleting files, `sudo`, `git push`, piping downloads into a shell).
 - The agent cannot leave the project folder (symlinks included), cannot touch `.git`, and cannot read `.env` files.
-- Your keys are stored in a private file (`keys.env`, owner-only) or your environment. They are never printed or logged.
+- Keys entered through setup are stored in a private file (`keys.env`, owner-only) or your environment. Diagnostic logs redact shell command text and file contents. Chat transcripts and tool outputs remain local and may contain anything you choose to type or run, so keep the session folder private.
 - The router listens on `127.0.0.1` only, rejects requests from web pages, and logs metadata, never your prompts.
-- Saved chats include the file contents the agent read, so treat `~/.agt/sessions` as private. `agt sessions rm <id>` deletes one.
+- Saved chats include the file contents the agent read, so treat `~/.agt/sessions` as private. `agt sessions rm <full-id>` deletes one after confirmation. A chat cannot be resumed or removed by another AGT process while it is active.
 
 ## More
 

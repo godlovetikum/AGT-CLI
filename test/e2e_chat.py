@@ -4,7 +4,7 @@
 A fake model drives the chat: it asks to write and edit files, we review/approve/deny them, pin
 models, compact the history, resume a session, and enter an API key at a hidden prompt.
 Run: python3 test/e2e_chat.py"""
-import json, os, pty, select, socket, subprocess, sys, tempfile, threading, time, urllib.request
+import json, os, pty, re, select, socket, subprocess, sys, tempfile, threading, time, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -20,11 +20,22 @@ class Fake(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
     def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == '/v2/user.me':
+            obj = {'user_id': 'e2e-account'}
+        elif parsed.path == '/v2/task.detail':
+            task_id = urllib.parse.parse_qs(parsed.query).get('task_id', [''])[0]
+            obj = {'ok': True, 'task': {'id': task_id, 'status': 'stopped', 'task_type': 'standard', 'has_running_background_jobs': False}}
+        else:
+            obj = {'data': [{'id': 'models/zz-model'}]}
         self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
-        self.wfile.write(b'{"data":[{"id":"models/zz-model"}]}')
+        self.wfile.write(json.dumps(obj).encode())
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if self.path == '/v2/task.sendMessage':
+            out = json.dumps({'ok': True, 'task_id': body.get('task_id')}).encode()
+            self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers(); self.wfile.write(out); return
         calls.append(body)
         last = body['messages'][-1]
         text = last['content'] if last['role'] == 'user' else ''
@@ -45,7 +56,8 @@ home = tempfile.mkdtemp(); proj = tempfile.mkdtemp(); data = home + '/data'
 sk = socket.socket(); sk.bind(('127.0.0.1', 0)); port = sk.getsockname()[1]; sk.close()
 os.makedirs(data, exist_ok=True)
 json.dump({'port': port, 'defaultLane': 'edit', 'aliases': {'fast': 'a/fast-model'},
-           'providers': {'a': {'url': f'http://127.0.0.1:{srv.server_port}', 'keyEnv': 'A_KEY'}},
+           'providers': {'a': {'url': f'http://127.0.0.1:{srv.server_port}', 'keyEnv': 'A_KEY'},
+                         'manus': {'type': 'manus', 'url': f'http://127.0.0.1:{srv.server_port}', 'keyEnv': 'MANUS_KEY'}},
            'lanes': {'edit': [['a', 'm']]}}, open(data + '/config.json', 'w'))
 BASE_ENV = dict(os.environ, AGT_HOME=data, HOME=home, USERPROFILE=home, NO_COLOR='1', TERM='xterm', AGT_NO_UPDATE_CHECK='1')
 open(proj + '/crlf.txt', 'wb').write(b'one\r\ntwo\r\nthree\r\n')
@@ -66,7 +78,12 @@ class Term:
                 try:
                     chunk = os.read(self.m, 4096).decode(errors='replace'); self.buf += chunk; self.all += chunk
                 except OSError: break
-        sys.exit(f'FAIL: never saw {text!r}\n--- got ---\n{self.buf}')
+        status = self.p.poll()
+        if status is None:
+            self.p.terminate()
+            try: status = self.p.wait(timeout=2)
+            except subprocess.TimeoutExpired: self.p.kill(); status = self.p.wait()
+        sys.exit(f'FAIL: never saw {text!r} (exit={status})\n--- remaining ---\n{self.buf}\n--- full output ---\n{self.all}')
 
     def send(self, t, end='\n'): os.write(self.m, (t + end).encode())
     def wait(self, timeout=15): return self.p.wait(timeout=timeout)
@@ -77,7 +94,7 @@ def router_running():
     except Exception: return False
 
 
-env = dict(BASE_ENV, A_KEY='k')
+env = dict(BASE_ENV, A_KEY='k', MANUS_KEY='manus-test-key')
 
 # ---------- 1. chat: review options, CRLF edit, deny with a reason ----------
 t = Term(['chat'], env)
@@ -92,6 +109,20 @@ assert not os.path.exists(proj + '/hello.txt'), 'nothing is written before appro
 t.expect('apply?'); t.send('y')
 t.expect('applied'); t.expect('Done: Wrote hello.txt')
 assert open(proj + '/hello.txt').read() == 'hello\n'
+match = re.search(r'\bsession ([A-Za-z0-9_-]+) · lane\b', t.all)
+assert match, f'could not find active chat session id in startup output: {t.all}'
+active_id = match.group(1)
+blocked_delete = subprocess.run(['node', CLI, 'sessions', 'rm', active_id, '--yes'], cwd=proj, env=env, text=True, capture_output=True)
+assert blocked_delete.returncode == 1 and 'is active' in blocked_delete.stdout, blocked_delete.stdout + blocked_delete.stderr
+duplicate = Term(['resume', active_id], env)
+duplicate.expect('already active')
+assert duplicate.wait() == 1
+assert os.path.exists(data + '/sessions/' + active_id + '.json'), 'active chat must remain saved'
+
+t.expect('[edit] ›'); t.send('/tasks resume external-task')
+t.expect('attached this chat to stopped Manus task external-task')
+t.expect('[model: manus/agent] ›')
+t.send('/model auto')
 
 t.expect('[edit] ›'); t.send('fix crlf please')
 t.expect('EDIT crlf.txt'); t.expect('apply?'); t.send('y'); t.expect('applied')
@@ -105,7 +136,7 @@ assert not os.path.exists(proj + '/deny.txt')
 
 # ---------- 2. pinning a model, separate from the lane ----------
 t.expect('[edit] ›'); t.send('/model'); t.expect('no model pinned')
-t.expect('[edit] ›'); t.send('/model nonsense/zzz'); t.expect('is not an alias, a lane or a provider/model')
+t.expect('[edit] ›'); t.send('/model nonsense/zzz'); t.expect('is not a lane, alias, or exact provider/model-id')
 t.expect('[edit] ›'); t.send('/model fast'); t.expect('model pinned: fast (a/fast-model)')
 t.expect('[model: fast] ›'); t.send('hello there'); t.expect('plain reply')
 assert calls[-1]['model'] == 'fast-model', calls[-1]['model']

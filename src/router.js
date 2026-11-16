@@ -16,7 +16,7 @@ const cooling = {};   // "provider/model" -> time it may be used again
 const session = {};   // counts since this router started
 let daily = {};       // UTC date -> "provider/model" -> { ok, fail }
 let dirty = false, logCount = 0;
-try { daily = JSON.parse(fs.readFileSync(P.stats, 'utf8')).daily || {}; } catch {}
+try { daily = JSON.parse(G.readPrivateFile(P.stats)).daily || {}; } catch {}
 
 function log(level, event, data = {}) {
   const rec = { ts: new Date().toISOString(), level, event, ...data };
@@ -33,7 +33,7 @@ function bump(k, f) {
 function saveStats() {
   if (!dirty) return;
   daily = Object.fromEntries(Object.keys(daily).sort().slice(-7).map(d => [d, daily[d]]));
-  try { fs.writeFileSync(P.stats + '.tmp', JSON.stringify({ daily })); fs.renameSync(P.stats + '.tmp', P.stats); dirty = false; }
+  try { G.writePrivateFile(P.stats, JSON.stringify({ daily })); dirty = false; }
   catch (e) { log('warn', 'stats_save_failed', { error: e.message }); }
 }
 setInterval(saveStats, 5000).unref();
@@ -133,6 +133,7 @@ async function handleChat(req, res) {
       return send(res, e.status && e.status >= 400 && e.status < 500 ? e.status : 502, {
         error: { message: e.message },
         ...(e.manusTaskId ? { manus_task_id: e.manusTaskId, manus_user_id: e.manusUserId } : {}),
+        ...(e.manusAmbiguousCreate ? { manus_ambiguous_create: true } : {}),
       }, { 'x-router-id': rid, 'x-router-via': provider + '/' + modelId, ...(e.manusTaskId ? { 'x-manus-task-id': e.manusTaskId, 'x-manus-user-id': e.manusUserId || '' } : {}) });
     }
   }
@@ -228,7 +229,7 @@ const server = http.createServer(async (req, res) => {
 function shutdown(code) {
   log('info', 'shutdown');
   saveStats();
-  try { if (fs.readFileSync(P.pid, 'utf8').trim() === String(process.pid)) fs.unlinkSync(P.pid); } catch {}
+  try { if (G.readPrivateFile(P.pid).trim() === String(process.pid)) fs.unlinkSync(P.pid); } catch {}
   server.close();
   setTimeout(() => process.exit(code), 300).unref();
 }
@@ -241,6 +242,6 @@ server.on('error', e => {
   throw e;
 });
 server.listen(CFG.port, '127.0.0.1', () => {
-  try { fs.writeFileSync(P.pid, String(process.pid)); } catch {}
+  try { G.writePrivateFile(P.pid, String(process.pid)); } catch {}
   log('info', 'start', { port: CFG.port, pid: process.pid, version: G.VERSION, node: process.version, providers: Object.keys(CFG.providers).filter(n => G.keyOf(CFG, n)).join(',') || 'NONE' });
 });

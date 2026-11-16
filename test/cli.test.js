@@ -14,8 +14,15 @@ test('version, help and unknown commands', async () => {
   assert.match(cli(['--version'], s.env).stdout, new RegExp('^agt ' + VERSION.replace(/\./g, '\\.')));
   const h = cli(['help'], s.env);
   assert.strictEqual(h.status, 0);
-  for (const w of ['chat', 'doctor', 'router', 'undo', 'config', 'resources']) assert.match(h.stdout, new RegExp(w));
+  for (const w of ['chat', 'doctor', 'router', 'undo', 'config', 'resources', 'tasks', 'manus/agent', 'sessions rm']) assert.match(h.stdout, new RegExp(w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(cli(['help', 'undo'], s.env).stdout, /restore a file/);
+  for (const cmd of ['chat', 'resume', 'setup', 'keys', 'models', 'router', 'health', 'stats', 'doctor', 'logs', 'sessions', 'tasks', 'show', 'changes', 'undo', 'config', 'resources', 'update', 'help', 'version']) {
+    const page = cli(['help', cmd], s.env);
+    assert.strictEqual(page.status, 0, `help for ${cmd} should be available`);
+    assert.match(page.stdout, new RegExp(`Usage: agt ${cmd}|Usage: agt \\[`), `help for ${cmd} should show usage`);
+  }
+  assert.strictEqual(cli(['help', 'not-a-command'], s.env).status, 1);
+  assert.match(cli(['help', 'tasks'], s.env).stdout, /remote Manus account tasks/);
   const bad = cli(['nonsense'], s.env);
   assert.strictEqual(bad.status, 1);
   assert.match(bad.stdout, /unknown command/);
@@ -108,6 +115,14 @@ test('router start / health / stop lifecycle through the CLI', async t => {
   assert.strictEqual(cli(['health'], s.env).status, 1);
 });
 
+test('router stop refuses a corrupt PID 0 instead of signaling the process group', async () => {
+  const s = await setup({ a: { url: 'http://127.0.0.1:1', keyEnv: 'A_KEY' } }, LANES);
+  fs.writeFileSync(path.join(s.home, 'router.pid'), '0');
+  const r = cli(['router', 'stop'], s.env);
+  assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /refusing to signal an invalid PID/);
+});
+
 test('chat refuses to run without a terminal', async () => {
   const s = await setup({ a: { url: 'http://127.0.0.1:1', keyEnv: 'A_KEY' } }, LANES);
   const r = cli(['chat'], s.env, { input: '' });
@@ -123,6 +138,58 @@ test('sessions, changes and undo work on an empty history', async () => {
   assert.strictEqual(u.status, 1);
   assert.match(u.stdout, /nothing to undo/);
   assert.strictEqual(cli(['show', 'nope'], s.env).status, 1);
+});
+
+test('sessions rm requires an exact full id and confirmation, then removes session snapshots but keeps undo backups', async () => {
+  const s = await setup({ a: { url: 'http://127.0.0.1:1', keyEnv: 'A_KEY' } }, LANES);
+  const sessions = path.join(s.home, 'sessions');
+  const id = '20261115000000-abcd';
+  fs.mkdirSync(sessions, { recursive: true });
+  fs.writeFileSync(path.join(sessions, `${id}.json`), JSON.stringify({ id, cwd: os.tmpdir(), lane: 'edit', model: 'manus/agent', messages: [{ role: 'user', content: 'private chat' }], updated: new Date().toISOString(), manusTaskId: 'remote-1' }));
+  fs.writeFileSync(path.join(sessions, `${id}.123.precompact.bak`), 'full history snapshot');
+  fs.writeFileSync(path.join(sessions, `${id}.json.tmp`), 'temporary session file');
+  const undoBackup = path.join(s.home, 'backups', 'session', '1-note.txt');
+  fs.mkdirSync(path.dirname(undoBackup), { recursive: true });
+  fs.writeFileSync(undoBackup, 'preserve for undo');
+
+  const noConfirm = cli(['sessions', 'rm', id], s.env);
+  assert.strictEqual(noConfirm.status, 1);
+  assert.match(noConfirm.stdout, /rerun with --yes/);
+  assert.ok(fs.existsSync(path.join(sessions, `${id}.json`)));
+
+  const partial = cli(['sessions', 'rm', id.slice(0, 15), '--yes'], s.env);
+  assert.strictEqual(partial.status, 1);
+  assert.match(partial.stdout, /use the full session id/);
+
+  const deleted = cli(['sessions', 'rm', id, '--yes'], s.env);
+  assert.strictEqual(deleted.status, 0, deleted.stdout + deleted.stderr);
+  assert.match(deleted.stdout, /deleted local chat/);
+  assert.ok(!fs.existsSync(path.join(sessions, `${id}.json`)));
+  assert.ok(!fs.existsSync(path.join(sessions, `${id}.123.precompact.bak`)));
+  assert.ok(!fs.existsSync(path.join(sessions, `${id}.json.tmp`)));
+  assert.strictEqual(fs.readFileSync(undoBackup, 'utf8'), 'preserve for undo');
+});
+
+test('AGT refuses a symlinked private sessions directory instead of reading outside data', { skip: process.platform === 'win32' }, async () => {
+  const s = await setup({ a: { url: 'http://127.0.0.1:1', keyEnv: 'A_KEY' } }, LANES);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'agt-outside-sessions-'));
+  fs.writeFileSync(path.join(outside, 'private.json'), JSON.stringify({ id: 'private', cwd: outside, messages: [{ role: 'user', content: 'outside' }] }));
+  fs.rmSync(path.join(s.home, 'sessions'), { recursive: true, force: true });
+  fs.symlinkSync(outside, path.join(s.home, 'sessions'), 'dir');
+  const r = cli(['sessions'], s.env);
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stdout, /private directory must not be a symlink/);
+  assert.strictEqual(fs.readFileSync(path.join(outside, 'private.json'), 'utf8').includes('outside'), true);
+});
+
+test('agt stats reads the last persisted daily snapshot when the router is stopped', async () => {
+  const s = await setup({ a: { url: 'http://127.0.0.1:1', keyEnv: 'A_KEY' } }, LANES);
+  fs.writeFileSync(path.join(s.home, 'router-stats.json'), JSON.stringify({ daily: { '2026-11-15': { 'a/model-a': { ok: 4, fail: 2 } } } }));
+  const r = cli(['stats'], s.env);
+  assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /router is stopped; showing the last persisted snapshot/);
+  assert.match(r.stdout, /4 ok/);
+  assert.match(r.stdout, /2 failed/);
 });
 
 test('undo restores a backed-up file and refuses when the file changed since', async () => {
@@ -146,4 +213,38 @@ test('undo restores a backed-up file and refuses when the file changed since', a
   assert.strictEqual(forced.status, 0, forced.stdout);
   assert.strictEqual(fs.readFileSync(file, 'utf8'), 'old');
   assert.match(cli(['changes'], s.env).stdout, /undone/);
+});
+
+test('undo rejects forged absolute paths and symlinked project or backup targets', { skip: process.platform === 'win32' }, async () => {
+  const s = await setup({ a: { url: 'http://127.0.0.1:1', keyEnv: 'A_KEY' } }, LANES);
+  const proj = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'agt-undo-safe-')));
+  const outside = path.join(os.tmpdir(), `agt-outside-${process.pid}-${Date.now()}.txt`);
+  fs.writeFileSync(outside, 'must stay unchanged');
+  const inside = path.join(proj, 'inside.txt');
+  fs.writeFileSync(inside, 'new');
+  const sha = require('crypto').createHash('sha1').update('new').digest('hex');
+  const log = path.join(s.home, 'changes.jsonl');
+
+  fs.writeFileSync(log, JSON.stringify({ id: 11, ts: new Date().toISOString(), action: 'write', status: 'applied', path: 'inside.txt', abs: outside, cwd: proj, backup: null, sha_after: sha }) + '\n');
+  const forged = cli(['undo', '11'], s.env, { cwd: proj, input: 'y\n' });
+  assert.strictEqual(forged.status, 1);
+  assert.match(forged.stdout, /does not match/);
+  assert.strictEqual(fs.readFileSync(outside, 'utf8'), 'must stay unchanged');
+
+  const backup = path.join(s.home, 'backups', 'sess', 'outside.txt');
+  fs.mkdirSync(path.dirname(backup), { recursive: true });
+  fs.symlinkSync(outside, backup);
+  fs.writeFileSync(log, JSON.stringify({ id: 12, ts: new Date().toISOString(), action: 'write', status: 'applied', path: 'inside.txt', abs: inside, cwd: proj, backup, sha_after: sha }) + '\n');
+  const backupLink = cli(['undo', '12'], s.env, { cwd: proj, input: 'y\n' });
+  assert.strictEqual(backupLink.status, 1);
+  assert.match(backupLink.stdout, /symbolic links are not allowed in backups/);
+  assert.strictEqual(fs.readFileSync(outside, 'utf8'), 'must stay unchanged');
+
+  const alias = path.join(proj, 'alias.txt');
+  fs.symlinkSync(outside, alias);
+  fs.writeFileSync(log, JSON.stringify({ id: 13, ts: new Date().toISOString(), action: 'write', status: 'applied', path: 'alias.txt', abs: alias, cwd: proj, backup: null, sha_after: sha }) + '\n');
+  const targetLink = cli(['undo', '13', '--force'], s.env, { cwd: proj, input: 'y\n' });
+  assert.strictEqual(targetLink.status, 1);
+  assert.match(targetLink.stdout, /unsafe undo target|symbolic links/);
+  assert.strictEqual(fs.readFileSync(outside, 'utf8'), 'must stay unchanged');
 });

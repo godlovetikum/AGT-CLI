@@ -79,6 +79,19 @@ test('keys with spaces, quotes or nothing at all are refused', async () => {
   assert.ok(!fs.existsSync(path.join(s.home, 'keys.env')));
 });
 
+test('keys set refuses a symlinked keys.env and leaves its target unchanged', { skip: process.platform === 'win32' }, async () => {
+  const s = await setup({ a: { url: 'http://127.0.0.1:1', keyEnv: 'A_KEY' } }, LANES);
+  const outside = path.join(os.tmpdir(), `agt-outside-keys-${process.pid}-${Date.now()}`);
+  fs.writeFileSync(outside, 'do-not-overwrite\n');
+  fs.symlinkSync(outside, path.join(s.home, 'keys.env'));
+  const env = { ...s.env }; delete env.A_KEY;
+  const r = cli(['keys', 'set', 'a', '--stdin', '--no-test'], env, { input: 'replacement-key\n' });
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stdout, /regular file, not a symlink/);
+  assert.strictEqual(fs.readFileSync(outside, 'utf8'), 'do-not-overwrite\n');
+  assert.ok(!r.stdout.includes('replacement-key'));
+});
+
 test('the router also reads the keys file (so a standalone router works)', async t => {
   const { startRouter, waitUp, post } = require('./helpers');
   const a = await mockProvider(() => null);

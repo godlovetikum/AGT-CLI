@@ -2,6 +2,7 @@
 // API keys can come from the environment or from a private keys file (keys.env in the data
 // folder). The environment always wins. The file works the same on every OS, with no shell setup.
 const fs = require('fs');
+const crypto = require('crypto');
 const { P } = require('./common');
 
 const SOURCE = {}; // VARIABLE_NAME -> 'keys file', for values this module loaded
@@ -23,7 +24,17 @@ function parse(text) {
   return out;
 }
 
-function readFile() { try { return parse(fs.readFileSync(P.keys, 'utf8')); } catch { return {}; } }
+function regularKeyFile() {
+  try {
+    const st = fs.lstatSync(P.keys);
+    if (st.isSymbolicLink() || !st.isFile()) throw new Error('keys.env must be a regular file, not a symlink');
+    return true;
+  } catch (e) { if (e.code === 'ENOENT') return false; throw e; }
+}
+function readFile() {
+  try { return regularKeyFile() ? parse(fs.readFileSync(P.keys, 'utf8')) : {}; }
+  catch { return {}; }
+}
 
 function loadKeys() {
   const vals = readFile();
@@ -37,12 +48,29 @@ function loadKeys() {
   return vals;
 }
 
-function lines() { try { return fs.readFileSync(P.keys, 'utf8').split(/\r?\n/); } catch { return null; } }
+function lines() {
+  if (!regularKeyFile()) return null;
+  return fs.readFileSync(P.keys, 'utf8').split(/\r?\n/);
+}
 
 function write(ls) {
   fs.mkdirSync(P.home, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(P.keys, ls.join('\n').replace(/\n*$/, '\n'), { mode: 0o600 });
-  try { fs.chmodSync(P.keys, 0o600); } catch {}
+  regularKeyFile();
+  const tmp = `${P.keys}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+  let fd;
+  try {
+    fd = fs.openSync(tmp, 'wx', 0o600);
+    fs.writeFileSync(fd, ls.join('\n').replace(/\n*$/, '\n'));
+    try { fs.fchmodSync(fd, 0o600); } catch {}
+    fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = undefined;
+    regularKeyFile();
+    fs.renameSync(tmp, P.keys);
+  } catch (e) {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    throw e;
+  }
 }
 
 const dropVar = (ls, name) => ls.filter(l => { const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(l); return !(m && m[1] === name); });

@@ -31,9 +31,11 @@ Commands (`run_command`) ask `[y]es [n]o` and print their full output.
 | `/new` | Start a new session (the old one stays saved) |
 | `/compact` | Summarize the chat to save tokens; the full history is kept |
 | `/status` | Session, context size, router health |
-| `/health [deep]`, `/stats`, `/log [n]` | Router information |
+| `/health [deep]`, `/stats`, `/log [n]` | Router information; `/stats` also shows the last saved snapshot when offline |
 | `/changes`, `/undo [id]` | Change history and undo |
-| `/sessions`, `/debug`, `/exit` | Sessions, verbose debug lines, quit |
+| `/sessions [count]`, `/sessions rm <full-id>` | List or delete a local chat (confirmation required) |
+| `/tasks [list|show|resume|stop|delete]` | List/manage Manus account tasks; resume only stopped tasks with no background jobs |
+| `/debug`, `/exit` | Toggle verbose debug lines, quit |
 
 Pasted multi-line text is sent as one message. Ctrl+C cancels a running request.
 
@@ -51,7 +53,7 @@ Manus is selected separately from lanes because its API runs asynchronous tasks:
 
 - Every step resends the conversation, so long chats burn tokens. Use `/compact`, or `/new` for a fresh task.
 - A small per-minute token limit (Groq's free tier is about 8,000) can reject big requests. Pin a large-context model for big files: `/model big`.
-- `agt stats` shows how many requests each model has served today.
+- `agt stats` shows how many requests each model has served today. If the router is stopped, it shows the last persisted snapshot.
 
 ## Where things live
 
@@ -61,6 +63,6 @@ Manus is selected separately from lanes because its API runs asynchronous tasks:
 |---|---|
 | `config.json` | Providers, lanes, aliases, limits |
 | `keys.env` | API keys (owner-only) |
-| `sessions/` | Saved chats |
+| `sessions/` | Saved chats; only one AGT process may actively use a chat at a time |
 | `changes.jsonl`, `backups/` | Change log and the original of every changed file |
 | `logs/` | `router.log`, `agent.log` |

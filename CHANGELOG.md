@@ -1,10 +1,14 @@
 # Changelog
 
-## Unreleased
+## 1.2.0
 
 - Add a separately pinned Manus API v2 task provider (`manus/agent`) with per-turn structured tool-request translation, private task continuity, account-aware recovery, and no automatic Manus-side action confirmations.
 - Add selectable initial project context and editable persistent Manus instructions, project-knowledge templates, and reusable workflow resources (`agt resources`).
-- Include Manus setup, configuration, API documentation, and mock task/router regression tests while leaving existing synchronous provider lanes unchanged.
+- Give users explicit control of lanes, exact provider/model pins, local chats, and Manus account task lists; add confirmed stop/delete operations, safe continuation of stopped Manus tasks, safe session deletion, and per-command help text.
+- Harden project-file, resource, key, session, backup, and AGT data-directory handling against symlink escapes and secret-file reads; revalidate reviewed file changes before applying them.
+- Prevent concurrent chat processes from corrupting a session, validate undo records and backups, and avoid retaining raw shell arguments or file contents in diagnostic logs.
+- Make statistics available from the last persisted snapshot when the router is stopped, and improve Manus connector isolation, message-limit recovery, rate-limit retries, and task error recovery.
+- Include comprehensive CLI, task API, install, path-security, session-lock, undo, and end-to-end regression tests; preserve existing synchronous provider lanes.
 
 ## 1.1.0
 

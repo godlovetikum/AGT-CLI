@@ -5,6 +5,8 @@ const { spawn, spawnSync, exec } = require('child_process');
 const G = require('./common');
 const T = require('./textutil');
 const K = require('./keys');
+const Manus = require('./manus');
+const PathPolicy = require('./path-policy');
 const { P, c, sym } = G;
 const PKG_NAME = require('../package.json').name;
 
@@ -35,7 +37,8 @@ function parseArgs(args) {
     else if (a === '-h') flags.help = true;
     else if (a === '-v') flags.version = true;
     else if (a === '--model' || a === '--lane') flags[a.slice(2)] = args[++i];
-    else if (a.startsWith('--')) { const [k, v] = a.slice(2).split('='); flags[k] = v === undefined ? true : v; }
+    else if (a === '--limit' || a === '--cursor') flags[a.slice(2)] = args[++i];
+    else if (a.startsWith('--')) { const raw = a.slice(2), eq = raw.indexOf('='); const k = eq < 0 ? raw : raw.slice(0, eq), v = eq < 0 ? undefined : raw.slice(eq + 1); flags[k] = v === undefined ? true : v; }
     else pos.push(a);
   }
   return { flags, pos };
@@ -63,8 +66,10 @@ async function startRouter() {
   const cur = await rget('/health');
   if (cur && cur.json && cur.json.status) return { already: true, health: cur.json };
   G.ensureDirs();
-  const fd = fs.openSync(P.routerOut, 'a');
-  const child = spawn(process.execPath, [path.join(__dirname, 'router.js')], { detached: true, windowsHide: true, stdio: ['ignore', fd, fd], env: process.env });
+  const fd = G.openPrivateAppend(P.routerOut);
+  let child;
+  try { child = spawn(process.execPath, [path.join(__dirname, 'router.js')], { detached: true, windowsHide: true, stdio: ['ignore', fd, fd], env: process.env }); }
+  finally { try { fs.closeSync(fd); } catch {} }
   let spawnErr = null;
   child.on('error', e => { spawnErr = e; });
   child.unref();
@@ -80,7 +85,21 @@ async function stopRouter() {
   const r = await rget('/admin/shutdown', { method: 'POST' });
   if (r && r.ok) { for (let i = 0; i < 20; i++) { await sleep(150); if (!(await rget('/health', { timeout: 500 }))) break; } return 'stopped'; }
   if (r) return 'could not stop it (an old router? end the node process that runs it, or restart your terminal)';
-  try { process.kill(Number(fs.readFileSync(P.pid, 'utf8')), 'SIGTERM'); await sleep(500); return 'stopped (via pid file)'; } catch { return 'not running'; }
+  let pid;
+  try {
+    const raw = G.readPrivateFile(P.pid).trim();
+    if (!/^[1-9]\d{0,9}$/.test(raw)) return 'refusing to signal an invalid PID from the router file';
+    pid = Number(raw);
+    if (!Number.isSafeInteger(pid) || pid === process.pid) return 'refusing to signal an invalid or current-process PID';
+    process.kill(pid, 0);
+  } catch (e) { return e.code === 'ENOENT' || e.code === 'ESRCH' ? 'not running (stale PID file)' : e.code === 'EPERM' ? 'cannot verify permission to stop the router process' : 'not running'; }
+  const expected = path.resolve(__dirname, 'router.js');
+  const check = process.platform === 'win32'
+    ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`], { encoding: 'utf8', windowsHide: true, timeout: 3000 })
+    : spawnSync('ps', ['-p', String(pid), '-o', 'args='], { encoding: 'utf8', timeout: 3000 });
+  if (check.error || check.status !== 0 || !String(check.stdout || '').includes(expected)) return `refusing to signal PID ${pid}; it is not verified as this AGT router`;
+  try { process.kill(pid, 'SIGTERM'); await sleep(500); return 'stopped (via verified PID file)'; }
+  catch (e) { return e.code === 'ESRCH' ? 'not running' : `could not stop verified router PID ${pid}: ${e.message}`; }
 }
 
 // ================= display helpers =================
@@ -125,54 +144,155 @@ function followLog(file) {
 }
 
 // ================= sessions & change log =================
-const nextId = () => G.readJsonl(P.changes).reduce((m, x) => Math.max(m, x.id || 0), 0) + 1;
+const nextId = () => `chg_${Date.now().toString(36)}_${rand(8)}`;
 function logChange(rec) { G.appendJsonl(P.changes, { ts: new Date().toISOString(), session: S && S.id, cwd: ROOT, ...rec }); }
+function privateCommandMeta(command) {
+  const value = String(command || '');
+  return { command_summary: 'command details omitted', command_length: Buffer.byteLength(value), command_sha256: crypto.createHash('sha256').update(value).digest('hex') };
+}
+function safeToolLogArgs(name, args) {
+  if (name === 'run_command') return { path: ROOT, ...privateCommandMeta(args.command) };
+  if (name === 'write_file') return { path: args.path, content_chars: String(args.content || '').length };
+  if (name === 'edit_file') return { path: args.path, old_chars: String(args.old_str || '').length, new_chars: String(args.new_str || '').length };
+  return args;
+}
+const sessionLocks = new Map();
+const sessionLockPath = id => path.join(P.sessions, `.${id}.lock`);
+function lockOwner(id) {
+  const file = sessionLockPath(id);
+  let st;
+  try { st = fs.lstatSync(file); } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+  if (st.isSymbolicLink()) return { pid: null, malformed: true };
+  let lock;
+  try { lock = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+  const pid = Number(lock && lock.pid);
+  if (Number.isSafeInteger(pid) && pid > 0) {
+    try { process.kill(pid, 0); return lock; } catch (e) { if (e.code === 'EPERM') return lock; }
+  } else if (Date.now() - st.mtimeMs < 30000) return { pid: null, malformed: true };
+  try { fs.rmSync(file, { force: true }); } catch {}
+  return null;
+}
+function sessionLockedByOther(id) {
+  const owner = lockOwner(id);
+  return !!owner && !sessionLocks.has(id);
+}
+function acquireSessionLock(id) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) throw new Error('invalid session id');
+  G.ensureDirs();
+  const token = rand(16), file = sessionLockPath(id);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let fd;
+    try {
+      fd = fs.openSync(file, 'wx', 0o600);
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, token, started: new Date().toISOString() }));
+      fs.fsyncSync(fd); fs.closeSync(fd);
+      sessionLocks.set(id, token);
+      return;
+    } catch (e) {
+      if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+      if (e.code !== 'EEXIST') throw e;
+      const owner = lockOwner(id);
+      if (owner) throw new Error(`session ${id} is already active in process ${owner.pid || 'unknown'}; close that chat before resuming it`);
+    }
+  }
+  throw new Error(`could not acquire a lock for session ${id}`);
+}
+function releaseSessionLock(id) {
+  const token = sessionLocks.get(id);
+  if (!token) return;
+  try {
+    const file = sessionLockPath(id), lock = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (lock.pid === process.pid && lock.token === token) fs.rmSync(file, { force: true });
+  } catch {}
+  sessionLocks.delete(id);
+}
 function listSessions() {
   try {
+    const root = fs.realpathSync(P.sessions);
     return fs.readdirSync(P.sessions).filter(f => f.endsWith('.json'))
-      .map(f => { try { return JSON.parse(fs.readFileSync(path.join(P.sessions, f), 'utf8')); } catch { return null; } })
+      .map(f => {
+        try {
+          const file = path.join(P.sessions, f), st = fs.lstatSync(file);
+          if (st.isSymbolicLink() || !st.isFile() || !T.isInside(root, fs.realpathSync(file))) return null;
+          const s = JSON.parse(fs.readFileSync(file, 'utf8'));
+          const fileId = f.slice(0, -5);
+          return s && typeof s.id === 'string' && s.id === fileId && /^[A-Za-z0-9_-]{1,128}$/.test(s.id) && Array.isArray(s.messages) ? s : null;
+        } catch { return null; }
+      })
       .filter(Boolean).sort((a, b) => (b.updated || '').localeCompare(a.updated || ''));
   } catch { return []; }
 }
-function findSession(part, cwd) {
-  const all = listSessions();
-  return part ? all.find(s => s.id.startsWith(part) || s.id.includes(part)) : all.find(s => !cwd || s.cwd === cwd);
+function sessionMatches(part, cwd) {
+  const all = listSessions().filter(s => !cwd || s.cwd === cwd);
+  if (!part) return all.length ? [all[0]] : [];
+  const exact = all.filter(s => s.id === part);
+  if (exact.length) return exact;
+  const prefix = all.filter(s => s.id.startsWith(part));
+  return prefix.length ? prefix : all.filter(s => s.id.includes(part));
 }
-const newSession = () => ({ id: new Date().toISOString().replace(/\D/g, '').slice(0, 14) + '-' + rand(2), cwd: ROOT, lane, model, created: new Date().toISOString(), updated: new Date().toISOString(), title: '', messages: [], usage: { prompt: 0, completion: 0 } });
+function findSession(part, cwd) {
+  const matches = sessionMatches(part, cwd);
+  return matches.length === 1 ? matches[0] : null;
+}
+const newSession = () => ({ id: new Date().toISOString().replace(/\D/g, '').slice(0, 14) + '-' + rand(6), cwd: ROOT, lane, model, created: new Date().toISOString(), updated: new Date().toISOString(), title: '', messages: [], usage: { prompt: 0, completion: 0 } });
 function saveSession() {
   if (!S || !S.messages.length) return;
   S.updated = new Date().toISOString(); S.lane = lane; S.model = model;
   const f = path.join(P.sessions, S.id + '.json');
-  fs.writeFileSync(f + '.tmp', JSON.stringify(S)); fs.renameSync(f + '.tmp', f);
+  const tmp = `${f}.${process.pid}.${rand(6)}.tmp`;
+  G.privateFilePath(f); G.privateFilePath(tmp);
+  fs.writeFileSync(tmp, JSON.stringify(S), { flag: 'wx', mode: 0o600 });
+  G.privateFilePath(f); fs.renameSync(tmp, f);
 }
 
 function copyMissingTree(from, to) {
   if (!fs.existsSync(from)) return;
+  try {
+    const dstStat = fs.lstatSync(to);
+    if (dstStat.isSymbolicLink() || !dstStat.isDirectory()) throw new Error('Manus resources path must be a real directory, not a symlink');
+  } catch (e) { if (e.code !== 'ENOENT') throw e; }
   fs.mkdirSync(to, { recursive: true, mode: 0o700 });
   for (const ent of fs.readdirSync(from, { withFileTypes: true })) {
     if (ent.isSymbolicLink()) continue;
     const src = path.join(from, ent.name), dst = path.join(to, ent.name);
+    let dstStat = null;
+    try { dstStat = fs.lstatSync(dst); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    if (dstStat && dstStat.isSymbolicLink()) throw new Error('Manus resources cannot contain symbolic links');
     if (ent.isDirectory()) copyMissingTree(src, dst);
-    else if (ent.isFile() && !fs.existsSync(dst)) fs.copyFileSync(src, dst);
+    else if (ent.isFile() && !dstStat) fs.copyFileSync(src, dst);
   }
 }
-function ensureManusResources() {
+function validatePrivateResourceRoot() {
   G.ensureDirs();
+  fs.mkdirSync(P.resources, { recursive: true, mode: 0o700 });
+  const st = fs.lstatSync(P.resources);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error('AGT resources path must be a real directory, not a symlink');
+  const homeReal = fs.realpathSync(P.home), resourcesReal = fs.realpathSync(P.resources);
+  if (!T.isInside(homeReal, resourcesReal)) throw new Error('AGT resources path resolves outside the private data folder');
+  return resourcesReal;
+}
+function ensureManusResources() {
+  validatePrivateResourceRoot();
   const packaged = path.join(__dirname, '..', 'resources');
   copyMissingTree(packaged, P.resources);
   const instructions = path.join(packaged, 'manus', 'AGT_INSTRUCTIONS.md');
-  if (!fs.existsSync(P.manusInstructions) && fs.existsSync(instructions)) fs.copyFileSync(instructions, P.manusInstructions);
+  try {
+    const st = fs.lstatSync(P.manusInstructions);
+    if (st.isSymbolicLink() || !st.isFile()) throw new Error('Manus instructions file must be a regular file, not a symlink');
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+    if (fs.existsSync(instructions)) fs.copyFileSync(instructions, P.manusInstructions, fs.constants.COPYFILE_EXCL);
+  }
 }
 function readManusInstructions() {
   ensureManusResources();
-  try { return fs.readFileSync(P.manusInstructions, 'utf8').slice(0, 6000); } catch { return ''; }
+  try {
+    const st = fs.lstatSync(P.manusInstructions);
+    if (st.isSymbolicLink() || !st.isFile()) return '';
+    return fs.readFileSync(P.manusInstructions, 'utf8').slice(0, 6000);
+  } catch { return ''; }
 }
-const contextBlocked = p => {
-  const base = path.basename(p);
-  return (/^\.env/i.test(base) && !/\.example$/i.test(base))
-    || /^(id_rsa|id_ed25519|id_ecdsa|credentials?|secrets?|tokens?)(?:[._-]|$)/i.test(base)
-    || /\.(pem|key|p12|pfx)$/i.test(base);
-};
+const { contextBlocked } = PathPolicy;
 const contextIgnoredDirs = new Set(['.git', '.agt', 'node_modules', '.venv', 'venv', 'dist', 'build', 'coverage', '.next', '.turbo', 'vendor']);
 function selectedContextPaths() {
   const raw = String(process.env.AGT_MANUS_CONTEXT || 'tree').trim();
@@ -206,9 +326,10 @@ function buildProjectContext() {
   const files = String(process.env.AGT_MANUS_CONTEXT_FILES || '').split(/[,\n]/).map(s => s.trim()).filter(Boolean);
   let chars = 0;
   for (const item of files) {
-    const full = path.resolve(root, item);
-    const segments = item.replace(/\\/g, '/').split('/').filter(Boolean);
-    if (!T.isInside(root, full) || contextBlocked(item) || segments.some(s => contextIgnoredDirs.has(s))) continue;
+    let full;
+    try { full = safe(item); } catch { continue; }
+    const segments = path.relative(root, full).replace(/\\/g, '/').split('/').filter(Boolean);
+    if (segments.some(s => contextIgnoredDirs.has(s))) continue;
     try {
       const lst = fs.lstatSync(full);
       if (!lst.isFile() || lst.isSymbolicLink() || lst.size > 24000) continue;
@@ -252,18 +373,8 @@ function isManusTarget() {
 const rel = full => path.relative(ROOT, full) || '.';
 const noGit = full => { if (path.relative(ROOT, full).split(path.sep).some(s => s.toLowerCase() === '.git')) throw new Error('.git is off limits'); };
 function safe(p) {
-  const full = path.resolve(ROOT, p || '.');
-  if (!T.isInside(ROOT, full)) throw new Error('path is outside the project folder');
+  const full = PathPolicy.projectPath(ROOT, p);
   noGit(full);
-  let real = null;
-  try { real = fs.realpathSync(full); } catch {}
-  if (real) {
-    let rootReal = ROOT;
-    try { rootReal = fs.realpathSync(ROOT); } catch {}
-    if (!T.isInside(rootReal, real)) throw new Error('path resolves outside the project folder (symlink)');
-  }
-  const base = path.basename(full);
-  if (/^\.env/i.test(base) && !/\.example$/i.test(base)) throw new Error('env files are blocked');
   return full;
 }
 const colorDiff = l => (l.startsWith('+') && !l.startsWith('+++') ? c.green(l) : l.startsWith('-') && !l.startsWith('---') ? c.red(l) : l.startsWith('@@') ? c.cyan(l) : c.dim(l));
@@ -289,8 +400,10 @@ async function review(action, r, before, after) {
     if (a === 'd') lines.forEach(l => out(colorDiff(l)));
     else if (a === 'v') out(c.dim('────── proposed file ──────') + '\n' + after + '\n' + c.dim('───────────────────────────'));
     else if (a === 's') {
+      G.ensureDirs();
       const f = path.join(P.proposed, `${Date.now()}-${path.basename(r)}`);
-      fs.writeFileSync(f, after);
+      G.privateFilePath(f);
+      fs.writeFileSync(f, after, { flag: 'wx', mode: 0o600 });
       out(c.dim(`  staged copy: ${f}\n  (your real file is untouched; open the copy in your editor, then answer here)`));
     } else if (a === 'n' || a === 'no' || a === '') {
       flush();
@@ -303,6 +416,17 @@ async function applyChange(action, full, before, after) {
   const r = rel(full);
   if (before === after) { out(`${c.cyan('▸')} ${action} ${r} ${c.dim('no change')}`); return 'No change: the file already has this content.'; }
   const d = await review(action, r, before, after);
+  if (d.ok) {
+    safe(r);
+    noGit(full);
+    let latest = null;
+    try {
+      const st = fs.lstatSync(full);
+      if (st.isSymbolicLink() || !st.isFile()) throw new Error('target is no longer a regular file');
+      latest = fs.readFileSync(full, 'utf8');
+    } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    if (latest !== before) throw new Error(`file ${r} changed while approval was pending; no change was applied. Read it again and retry.`);
+  }
   const id = nextId();
   if (!d.ok) {
     logChange({ id, action, status: 'denied', path: r, abs: full, reason: d.reason });
@@ -313,30 +437,87 @@ async function applyChange(action, full, before, after) {
   if (before !== null) {
     backup = path.join(P.backups, S.id, `${id}-${path.basename(full)}`);
     fs.mkdirSync(path.dirname(backup), { recursive: true });
-    fs.writeFileSync(backup, before);
+    G.privateFilePath(backup);
+    fs.writeFileSync(backup, before, { flag: 'wx', mode: 0o600 });
   }
   fs.mkdirSync(path.dirname(full), { recursive: true });
-  fs.writeFileSync(full, after);
-  logChange({ id, action, status: 'applied', path: r, abs: full, existed: before !== null, backup, sha_after: crypto.createHash('sha1').update(after).digest('hex'), added: d.added, removed: d.removed });
+  safe(r);
+  const temp = `${full}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  fs.writeFileSync(temp, after, { flag: 'wx' });
+  try { fs.renameSync(temp, full); } catch (e) { try { fs.rmSync(temp, { force: true }); } catch {} throw e; }
+  logChange({ id, action, status: 'applied', path: r, abs: full, existed: before !== null, backup, sha_before: before === null ? null : crypto.createHash('sha1').update(before).digest('hex'), sha_after: crypto.createHash('sha1').update(after).digest('hex'), added: d.added, removed: d.removed });
   out(`  ${sym.ok} applied ${c.dim('(change #' + id + ' · undo with /undo)')}`);
   return `${action === 'edit' ? 'Edited' : 'Wrote'} ${r} (+${d.added} -${d.removed} lines).`;
 }
 
 async function undoChange(askFn, id, force) {
   const all = G.readJsonl(P.changes);
-  const undone = new Set(all.filter(x => x.action === 'undo' && x.status === 'applied').map(x => x.of));
-  const cand = all.filter(x => (x.action === 'write' || x.action === 'edit') && x.status === 'applied' && !undone.has(x.id));
-  const t = id ? cand.find(x => x.id === id) : cand.filter(x => x.cwd === process.cwd()).pop();
+  const undone = new Set(all.filter(x => x.action === 'undo' && x.status === 'applied').map(x => String(x.of)));
+  const cand = all.filter(x => (x.action === 'write' || x.action === 'edit') && x.status === 'applied' && !undone.has(String(x.id)));
+  const t = id ? cand.find(x => String(x.id) === String(id)) : cand.filter(x => x.cwd === ROOT).pop();
   if (!t) { out('nothing to undo' + (id ? ` (no undoable change #${id})` : ' in this folder')); return 1; }
-  const cur = fs.existsSync(t.abs) ? fs.readFileSync(t.abs, 'utf8') : null;
-  const sha = cur === null ? null : crypto.createHash('sha1').update(cur).digest('hex');
+  let full;
+  try {
+    if (typeof t.cwd !== 'string' || path.relative(path.resolve(ROOT), path.resolve(t.cwd)) !== '') throw new Error('change record belongs to a different project folder');
+    if (typeof t.path !== 'string' || path.isAbsolute(t.path)) throw new Error('change record has an invalid relative path');
+    full = safe(t.path);
+    if (typeof t.abs !== 'string' || path.resolve(t.abs) !== full) throw new Error('change record path does not match its saved project-relative path');
+  } catch (e) { out(`${sym.fail} unsafe undo target: ${e.message}`); return 1; }
+  const backupFile = file => {
+    if (typeof file !== 'string') throw new Error('change record has no valid backup path');
+    const root = path.resolve(P.backups), abs = path.resolve(file);
+    if (!T.isInside(root, abs) || abs === root) throw new Error('backup is outside AGT backups');
+    const rootStat = fs.lstatSync(root);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error('backup directory must be a real directory');
+    let cursor = root;
+    for (const part of path.relative(root, abs).split(path.sep).filter(Boolean)) {
+      cursor = path.join(cursor, part);
+      const st = fs.lstatSync(cursor);
+      if (st.isSymbolicLink()) throw new Error('symbolic links are not allowed in backups');
+    }
+    const st = fs.lstatSync(abs);
+    if (!st.isFile()) throw new Error('backup is not a regular file');
+    if (!T.isInside(fs.realpathSync(root), fs.realpathSync(abs))) throw new Error('backup resolves outside AGT backups');
+    return abs;
+  };
+  const currentHash = () => {
+    safe(t.path);
+    let st;
+    try { st = fs.lstatSync(full); } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+    if (st.isSymbolicLink() || !st.isFile()) throw new Error('undo target is not a regular file');
+    return crypto.createHash('sha1').update(fs.readFileSync(full)).digest('hex');
+  };
+  let sha;
+  try { sha = currentHash(); } catch (e) { out(`${sym.fail} unsafe undo target: ${e.message}`); return 1; }
+  let validBackup = null;
+  if (t.backup) {
+    try {
+      validBackup = backupFile(t.backup);
+      const data = fs.readFileSync(validBackup);
+      if (t.sha_before && crypto.createHash('sha1').update(data).digest('hex') !== t.sha_before) throw new Error('backup contents do not match the recorded original');
+    } catch (e) { out(`${sym.fail} unsafe undo backup: ${e.message}`); return 1; }
+  }
   out(`${c.yellow('▸ UNDO')} #${t.id} ${t.action} ${c.bold(t.path)} ${c.dim(G.ago(t.ts))}`);
   out(c.dim(t.backup ? '  restores the version from before this change' : '  deletes the file this change created'));
   if (sha !== t.sha_after && !force) { out(`${sym.warn} the file changed since then. Undo later changes first, or run: agt undo ${t.id} --force`); return 1; }
   const a = (await askFn('proceed? [y/N] › ')).trim().toLowerCase();
   if (a !== 'y' && a !== 'yes') { out('left as is'); return 0; }
-  if (t.backup) fs.copyFileSync(t.backup, t.abs); else fs.rmSync(t.abs, { force: true });
-  G.appendJsonl(P.changes, { id: nextId(), ts: new Date().toISOString(), action: 'undo', of: t.id, status: 'applied', cwd: process.cwd(), path: t.path });
+  try {
+    const latest = currentHash();
+    if (latest !== t.sha_after && !force) throw new Error('the file changed while confirmation was pending; no undo was applied');
+    if (validBackup) {
+      validBackup = backupFile(t.backup);
+      const fd = fs.openSync(validBackup, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      let data;
+      try { if (!fs.fstatSync(fd).isFile()) throw new Error('backup is not a regular file'); data = fs.readFileSync(fd); }
+      finally { fs.closeSync(fd); }
+      if (t.sha_before && crypto.createHash('sha1').update(data).digest('hex') !== t.sha_before) throw new Error('backup changed while confirmation was pending');
+      const temp = `${full}.${process.pid}.${rand(6)}.undo`;
+      fs.writeFileSync(temp, data, { flag: 'wx' });
+      try { safe(t.path); fs.renameSync(temp, full); } catch (e) { try { fs.rmSync(temp, { force: true }); } catch {} throw e; }
+    } else { safe(t.path); fs.rmSync(full, { force: true }); }
+  } catch (e) { out(`${sym.fail} ${e.message}`); return 1; }
+  G.appendJsonl(P.changes, { id: nextId(), ts: new Date().toISOString(), action: 'undo', of: t.id, status: 'applied', cwd: ROOT, path: t.path });
   out(`${sym.ok} restored`);
   return 0;
 }
@@ -353,6 +534,7 @@ function safeResource(p) {
   ensureManusResources();
   const full = path.resolve(P.resources, p || '.');
   if (!T.isInside(P.resources, full)) throw new Error('resource path is outside AGT resources');
+  const rootReal = validatePrivateResourceRoot();
   const relPath = path.relative(P.resources, full);
   let cursor = P.resources;
   for (const part of relPath.split(path.sep).filter(Boolean)) {
@@ -360,7 +542,6 @@ function safeResource(p) {
     if (fs.existsSync(cursor) && fs.lstatSync(cursor).isSymbolicLink()) throw new Error('symbolic links are not allowed in resources');
   }
   if (relPath.split(path.sep).some(contextBlocked)) throw new Error('secret-like resource files are blocked');
-  const rootReal = fs.realpathSync(P.resources);
   const real = fs.existsSync(full) ? fs.realpathSync(full) : full;
   if (!T.isInside(rootReal, real)) throw new Error('resource path resolves outside AGT resources');
   return full;
@@ -379,6 +560,10 @@ const tools = {
     let t = fs.readFileSync(full, 'utf8');
     if (t.includes('\u0000')) throw new Error('binary file, not readable as text');
     const total = t.split('\n').length;
+    for (const [label, value] of [['start_line', start_line], ['end_line', end_line]]) {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) throw new Error(`${label} must be a positive integer`);
+    }
+    if (start_line && end_line && end_line < start_line) throw new Error('end_line must be greater than or equal to start_line');
     if (start_line || end_line) t = t.split('\n').slice((start_line || 1) - 1, end_line || undefined).join('\n');
     out(`${c.cyan('▸')} read_file ${c.bold(rel(full))} ${c.dim(total + ' lines, ' + G.bytes(Buffer.byteLength(t)) + (start_line || end_line ? `, range ${start_line || 1}-${end_line || total}` : ''))}`);
     return t;
@@ -430,7 +615,7 @@ const tools = {
     if (a !== 'y' && a !== 'yes') {
       flush();
       const why = (await ask(c.dim('  reason for the agent (optional) › '))).trim();
-      logChange({ id, action: 'run', status: 'denied', command, reason: why });
+      logChange({ id, action: 'run', status: 'denied', ...privateCommandMeta(command), reason: why });
       out(`  ${sym.fail} denied`);
       return 'The user denied this command.' + (why ? ' Reason: ' + why : '');
     }
@@ -441,7 +626,7 @@ const tools = {
     out(`${code === 0 ? sym.ok : sym.fail} exit ${code} ${c.dim('· ' + ((Date.now() - t0) / 1000).toFixed(1) + 's')}`);
     if (r.stdout) out(r.stdout.replace(/\n$/, ''));
     if (r.stderr) out(c.red(r.stderr.replace(/\n$/, '')));
-    logChange({ id, action: 'run', status: code === 0 ? 'applied' : 'failed', command, exit: code, ms: Date.now() - t0 });
+    logChange({ id, action: 'run', status: code === 0 ? 'applied' : 'failed', ...privateCommandMeta(command), exit: code, ms: Date.now() - t0 });
     return `exit code: ${code}${timedOut ? ` (timed out after ${CFG.commandTimeoutSec}s)` : ''}\n[stdout]\n${r.stdout}\n[stderr]\n${r.stderr}`;
   },
 };
@@ -463,8 +648,13 @@ let SYSTEM = '', ctl = null, thinking = false;
 function buildSystem() {
   let ctx = '';
   for (const f of ['GEMINI.md', 'AGENTS.md']) {
-    const fp = path.join(ROOT, f);
-    if (fs.existsSync(fp)) ctx += `\n\nProject notes (${f}):\n` + fs.readFileSync(fp, 'utf8').slice(0, CFG.maxToolChars);
+    try {
+      const fp = safe(f), st = fs.lstatSync(fp);
+      if (!st.isFile() || st.isSymbolicLink() || st.size > 6000) continue;
+      const note = fs.readFileSync(fp, 'utf8');
+      if (note.includes('\u0000')) continue;
+      ctx += `\n\nProject notes (${f}):\n` + note;
+    } catch {}
   }
   return `You are a careful coding agent working in ${ROOT}, on ${G.platformName()}. Shell commands run with ${process.platform === 'win32' ? 'cmd.exe' : 'sh'}. Inspect files with your tools before changing anything. Prefer edit_file with a small unique snippet over rewriting whole files. The user reviews every file change and command before it runs; if one is denied, read the reason and adjust. Tool output may be clipped: read large files in line ranges. Never read or print secrets or env files. Reference materials under AGT's private resources directory are available only through list_resources/read_resource. Keep replies short and say what you changed.` + ctx;
 }
@@ -520,6 +710,7 @@ async function callModel(signal) {
         // but do not send another message into an in-flight/ambiguous remote task.
         S.manusTaskId = null; S.manusUserId = null; manusTimeout = true;
       }
+      if (errorData.manus_ambiguous_create) manusTimeout = true;
     } catch {}
     const e = new Error(`router returned HTTP ${r.status}` + (rid ? ` (request ${rid})` : '')); e.detail = prettyErr(text); e.manusTimeout = manusTimeout; throw e;
   }
@@ -534,7 +725,7 @@ async function execTool(tc) {
   let args;
   try { args = JSON.parse(tc.function.arguments || '{}'); }
   catch (e) { const m = `Error: invalid JSON arguments: ${e.message}`; out(`${sym.fail} ${name}: ${m}`); return m; }
-  lg('debug', 'tool_call', { name, args: name === 'write_file' ? { path: args.path, chars: (args.content || '').length } : args });
+  lg('debug', 'tool_call', { name, args: safeToolLogArgs(name, args) });
   let result;
   try {
     if (!tools[name]) throw new Error('unknown tool ' + name);
@@ -591,21 +782,24 @@ async function runTurn(text) {
 
 // ================= chat =================
 const CHAT_HELP = `${c.bold('Chat commands')}
-  /plan  /edit      switch lane (see: agt config)
-  /lane <name>      switch to any lane in your config
-  /new              start a new session (the old one stays saved)
+  /plan, /edit      switch to the named configured lane
+  /lane <name>      switch to any configured lane; /lane lists lane names
+  /model <target>   pin an alias or exact provider/model-id; e.g. /model fast or /model manus/agent
+  /model auto       clear the pin and return to the current lane
+  /models [live]    list lanes and aliases; add live to list provider model IDs
+  /new              save this chat and start a separate session
+  /sessions [count] list local AGT chats; /sessions rm <full-id> deletes one
+  /tasks [list|show <id>|resume <id>|stop <id>|delete <id>]  manage Manus tasks
   /compact          summarize this chat to save tokens (full copy is kept)
-  /model [name]     pin one exact model (alias or provider/model); /model auto unpins
-  /models [live]    list lanes, aliases and models
-  /status           session, context size, router health
-  /health [deep]    router health (deep = live provider test)
-  /stats            request counts per provider
-  /log [n]          recent router log lines
-  /changes          files and commands the agent touched
+  /status           show session, context size, and router health
+  /health [deep]    show router health; deep also probes providers
+  /stats            show request counts per provider (saved snapshot works offline)
+  /log [n]          show recent router log lines
+  /changes          show files changed; shell command details are redacted
   /undo [id]        restore a file the agent changed
-  /sessions         list saved sessions
   /debug            toggle verbose debug lines
   /exit             save and quit
+${c.dim('Lane selects an ordered failover list. A model pin selects one exact model with no failover.')}
 ${c.dim('Pasted multi-line text is sent as one message. Ctrl+C cancels a running request.')}`;
 
 async function slash(line) {
@@ -621,12 +815,12 @@ async function slash(line) {
     case 'model': {
       if (!rest[0]) {
         out(model ? `pinned model: ${c.cyan(model)}  ${c.dim('(/model auto goes back to lane ' + lane + ')')}` : `no model pinned; routing by lane ${c.cyan(lane)}`);
-        out(c.dim('pin one: /model <alias|provider/model>    list them: /models'));
+        out(c.dim('pin one: /model <alias|provider/model-id>    e.g. /model manus/agent    list: /models'));
         break;
       }
       if (['auto', 'off', 'lane', 'none'].includes(rest[0])) { model = null; out(`model unpinned; routing by lane ${c.cyan(lane)}`); break; }
       const tg = G.resolveTarget(CFG, rest[0]);
-      if (!tg) { out(`${sym.fail} "${rest[0]}" is not an alias, a lane or a provider/model. Try /models`); break; }
+      if (!tg) { out(`${sym.fail} "${rest[0]}" is not a lane, alias, or exact provider/model-id. Example: /model manus/agent. See /models.`); break; }
       if (tg.type === 'lane') { lane = rest[0]; model = null; out(`"${rest[0]}" is a lane: lane set, model unpinned`); break; }
       if (!G.keyOf(CFG, tg.steps[0][0])) out(`${sym.warn} ${tg.steps[0][0]} has no API key yet: agt keys set ${tg.steps[0][0]}`);
       model = rest[0];
@@ -634,7 +828,7 @@ async function slash(line) {
       break;
     }
     case 'models': await printModels(rest.find(x => x !== 'live'), rest.includes('live')); break;
-    case 'new': saveSession(); S = newSession(); out(`new session ${S.id}`); break;
+    case 'new': saveSession(); releaseSessionLock(S.id); S = newSession(); acquireSessionLock(S.id); out(`new session ${S.id}`); break;
     case 'compact': await compact(); break;
     case 'status': {
       const est = Math.round(JSON.stringify(S.messages).length / 4);
@@ -649,15 +843,19 @@ async function slash(line) {
     case 'stats': await cmdStats(); break;
     case 'log': printLogLines(P.routerLog, Number(rest[0]) || 20); break;
     case 'changes': cmdChanges([], {}); break;
-    case 'undo': await undoChange(ask, rest[0] ? Number(rest[0]) : null, false); break;
-    case 'sessions': cmdSessions([]); break;
+    case 'undo':
+      if (rest[0] && !/^[A-Za-z0-9_-]{1,128}$/.test(rest[0])) out('change ID must contain only letters, digits, _ or -');
+      else await undoChange(ask, rest[0] || null, false);
+      break;
+    case 'sessions': await cmdSessions(rest); break;
+    case 'tasks': await cmdTasks(rest); break;
     case 'debug': debug = !debug; out(`debug ${debug ? 'on' : 'off'}`); break;
     case 'exit': case 'quit': return 'exit';
     default: out(`unknown command /${cmd}. Try /help`);
   }
 }
 
-async function cmdChat(pos, flags, resume) {
+async function cmdChat(pos, flags, resume, initialManusTask = null) {
   if (!process.stdin.isTTY) { out(c.red('chat needs an interactive terminal')); return 1; }
   G.ensureDirs(); G.rotate(P.agentLog);
   ROOT = process.cwd(); debug = !!flags.debug;
@@ -671,18 +869,14 @@ async function cmdChat(pos, flags, resume) {
     if (tg.type === 'lane') lane = flags.model; else model = flags.model;
   }
 
-  let rs;
-  try { rs = await startRouter(); } catch (e) { out(`${sym.fail} ${e.message}`); return 1; }
-  const startedRouter = !!rs.started, h = rs.health;
-  out(`${c.bold('router')} ${dot(h.status)} ${c.dim('· providers: ' + (h.providers.filter(p => p.configured).map(p => p.name).join(', ') || 'NONE'))}${startedRouter ? c.dim(' · just started') : ''}`);
-  if (h.status === 'down') {
-    if (isManusTarget() && G.keyOf(CFG, 'manus')) out(`${sym.warn} no synchronous lane provider is ready; the selected Manus task provider remains available.`);
-    else out(`${sym.warn} no provider can serve requests. Run: agt doctor`);
-  }
-
   if (resume) {
-    S = findSession(resume === true ? null : resume, ROOT);
-    if (!S) { out(`${sym.fail} no saved session found${resume === true ? ' for this folder' : ''}. List them: agt sessions`); return 1; }
+    const matches = sessionMatches(resume === true ? null : resume, ROOT);
+    S = matches.length === 1 ? matches[0] : null;
+    if (!S) {
+      if (matches.length > 1) out(`${sym.fail} session id is ambiguous; use a longer id: ${matches.map(x => x.id).join(', ')}`);
+      else out(`${sym.fail} no saved session found${resume === true ? ' for this folder' : ''}. List them: agt sessions`);
+      return 1;
+    }
     if (S.cwd !== ROOT) {
       if (!fs.existsSync(S.cwd)) { out(`${sym.fail} that session's folder no longer exists: ${S.cwd}`); return 1; }
       process.chdir(S.cwd); ROOT = S.cwd;
@@ -690,9 +884,25 @@ async function cmdChat(pos, flags, resume) {
     if (S.lane && CFG.lanes[S.lane]) lane = S.lane;
     if (S.model && !flags.model && G.resolveTarget(CFG, S.model)) model = S.model;
     S.usage = S.usage || { prompt: 0, completion: 0 };
-  } else S = newSession();
-  SYSTEM = buildSystem();
+  } else {
+    S = newSession();
+    if (initialManusTask) { S.manusTaskId = initialManusTask; S.manusUserId = null; S.manusTarget = 'manus/agent'; }
+  }
+  try { acquireSessionLock(S.id); }
+  catch (e) { out(`${sym.fail} ${e.message}`); return 1; }
+  try { SYSTEM = buildSystem(); }
+  catch (e) { releaseSessionLock(S.id); out(`${sym.fail} ${e.message}`); return 1; }
+  let rs;
+  try { rs = await startRouter(); }
+  catch (e) { releaseSessionLock(S.id); out(`${sym.fail} ${e.message}`); return 1; }
+  const startedRouter = !!rs.started, h = rs.health;
+  out(`${c.bold('router')} ${dot(h.status)} ${c.dim('· providers: ' + (h.providers.filter(p => p.configured).map(p => p.name).join(', ') || 'NONE'))}${startedRouter ? c.dim(' · just started') : ''}`);
+  if (h.status === 'down') {
+    if (isManusTarget() && G.keyOf(CFG, 'manus')) out(`${sym.warn} no synchronous lane provider is ready; the selected Manus task provider remains available.`);
+    else out(`${sym.warn} no provider can serve requests. Run: agt doctor`);
+  }
   out(`\n${c.bold('agt')} ${c.dim('v' + G.VERSION)} · ${ROOT}\n${c.dim('session ' + S.id + ' · lane ' + lane + (model ? ' · pinned ' + model : '') + (resume ? ` · resumed (${S.messages.length} messages)` : ''))}\n${c.dim('/help for commands · Ctrl+C cancels a request')}`);
+  if (initialManusTask) out(`${c.dim('attached to stopped Manus task ' + safeTerminalText(initialManusTask) + '; your next message continues it')}`);
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const queue = []; let waiter = null, waiting = false, quitting = false;
@@ -707,8 +917,10 @@ async function cmdChat(pos, flags, resume) {
   const quit = async (code = 0) => {
     if (quitting) return; quitting = true;
     saveSession();
-    if (startedRouter && !flags.keep) out(c.dim('router ' + await stopRouter()));
-    else if (startedRouter) out(c.dim('router left running (stop it with: agt router stop)'));
+    try {
+      if (startedRouter && !flags.keep) out(c.dim('router ' + await stopRouter()));
+      else if (startedRouter) out(c.dim('router left running (stop it with: agt router stop)'));
+    } finally { releaseSessionLock(S.id); }
     out(c.dim(S.messages.length ? `session saved: ${S.id}  ·  continue with: agt resume` : 'bye'));
     process.exit(code);
   };
@@ -847,9 +1059,25 @@ async function latestVersion() {
   } catch { return null; }
 }
 const newer = (a, b) => {
-  const p = v => String(v).split('-')[0].split('.').map(n => parseInt(n, 10) || 0);
-  const x = p(a), y = p(b);
-  for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0);
+  const parse = v => {
+    const m = /^(?:v)?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(String(v));
+    return m && { core: m.slice(1, 4).map(Number), pre: m[4] ? m[4].split('.') : null };
+  };
+  const x = parse(a), y = parse(b);
+  if (!x || !y) return false;
+  for (let i = 0; i < 3; i++) if (x.core[i] !== y.core[i]) return x.core[i] > y.core[i];
+  if (!x.pre && y.pre) return true;
+  if (x.pre && !y.pre) return false;
+  if (!x.pre && !y.pre) return false;
+  for (let i = 0; i < Math.max(x.pre.length, y.pre.length); i++) {
+    if (x.pre[i] === undefined) return false;
+    if (y.pre[i] === undefined) return true;
+    if (x.pre[i] === y.pre[i]) continue;
+    const xn = /^\d+$/.test(x.pre[i]), yn = /^\d+$/.test(y.pre[i]);
+    if (xn && yn) return Number(x.pre[i]) > Number(y.pre[i]);
+    if (xn !== yn) return !xn;
+    return x.pre[i] > y.pre[i];
+  }
   return false;
 };
 async function cmdUpdate(pos, flags) {
@@ -894,7 +1122,8 @@ async function printModels(filter, live) {
     else r.ids.forEach(id => out(`    ${name}/${id}`));
   }
   if (filter && !CFG.providers[filter]) out(`${sym.warn} no provider named "${filter}"`);
-  out(c.dim(`\npin one: /model <alias|provider/model-id>  (or: agt --model fast)${live ? '' : '\nsee every model a provider offers: agt models --live'}`));
+  out(c.dim(`\nLane: /lane <name>  ·  exact model: /model <alias|provider/model-id>  ·  clear pin: /model auto`));
+  out(c.dim(`Example Manus model: /model manus/agent  (or start with: agt --model manus/agent)${live ? '' : '\nsee provider model IDs: agt models --live'}`));
 }
 const cmdModels = (pos, flags) => printModels(pos[0], !!flags.live).then(() => 0);
 
@@ -938,14 +1167,24 @@ async function cmdHealth(pos, flags) {
 }
 async function cmdStats() {
   const r = await rget('/stats');
-  if (!r || !r.json) { out(c.red('router not running') + c.dim(' (agt router start)')); return 1; }
-  const s = r.json, days = Object.keys(s.daily).sort().reverse();
+  let data, offline = false;
+  if (r && r.json && r.json.daily) data = r.json;
+  else {
+    try { data = JSON.parse(G.readPrivateFile(P.stats)); offline = true; }
+    catch { out(c.red('no statistics available') + c.dim(' (start the router and make a request first)')); return 1; }
+  }
+  const daily = data.daily && typeof data.daily === 'object' ? data.daily : {};
+  const days = Object.keys(daily).sort().reverse();
   out(c.bold('Requests by day (UTC)'));
-  out(c.dim('  provider quotas reset on their own clocks, so treat this as an estimate'));
+  out(c.dim(offline ? '  router is stopped; showing the last persisted snapshot' : '  provider quotas reset on their own clocks, so treat this as an estimate'));
+  if (data.since_start && Object.keys(data.since_start).length) {
+    out(c.dim('  current router process:'));
+    for (const [k, v] of Object.entries(data.since_start)) out(`    ${k}: ${v.ok} ok · ${v.fail} failed`);
+  }
   if (!days.length) out('  none recorded yet');
   for (const d of days) {
     out(c.cyan(d));
-    for (const [k, v] of Object.entries(s.daily[d])) out(`  ${k}\n    ${c.green(v.ok + ' ok')} · ${v.fail ? c.red(v.fail + ' failed') : c.dim('0 failed')}`);
+    for (const [k, v] of Object.entries(daily[d] || {})) out(`  ${k}\n    ${c.green(Number(v.ok || 0) + ' ok')} · ${v.fail ? c.red(v.fail + ' failed') : c.dim('0 failed')}`);
   }
   return 0;
 }
@@ -993,26 +1232,201 @@ function cmdResources() {
   out(c.dim('Edit these Markdown files with your editor. Manus can list and read resources when relevant; they are not sent on every turn.'));
   return 0;
 }
-function cmdSessions(pos) {
-  if (pos[0] === 'rm') {
-    const s = pos[1] && findSession(pos[1]);
-    if (!s) { out('usage: agt sessions rm <id>'); return 1; }
-    fs.rmSync(path.join(P.sessions, s.id + '.json'), { force: true });
-    out(`${sym.ok} deleted chat ${s.id} ${c.dim('(file backups stay, so /undo still works)')}`);
-    return 0;
+async function confirmAction(prompt, yes) {
+  if (yes) return true;
+  if (!process.stdin.isTTY) { out(`${sym.warn} this action needs confirmation; rerun with --yes`); return null; }
+  const answer = String(await ask(`${prompt} [y/N] `)).trim().toLowerCase();
+  if (answer === 'y' || answer === 'yes') return true;
+  out('cancelled; no changes made');
+  return false;
+}
+async function cmdSessions(pos, flags = {}) {
+  if (pos[0] === 'rm' || pos[0] === 'delete') {
+    const id = pos[1];
+    if (!id || pos.length !== 2) { out('usage: agt sessions rm <full-session-id> [--yes]'); return 1; }
+    const all = listSessions();
+    const s = all.find(x => x.id === id);
+    if (!s) {
+      const matches = sessionMatches(id);
+      if (matches.length > 1) out(`session id is ambiguous; use the full id: ${matches.map(x => x.id).join(', ')}`);
+      else if (matches.length === 1) out(`use the full session id: ${matches[0].id}`);
+      else out(`no saved session with id "${id}"; list sessions with: agt sessions`);
+      return 1;
+    }
+    if (sessionLockedByOther(s.id)) {
+      const owner = lockOwner(s.id);
+      out(`${sym.fail} chat ${s.id} is active in process ${owner && owner.pid || 'unknown'}; close it before deleting the session`);
+      return 1;
+    }
+    const confirmed = await confirmAction(`Permanently delete local chat ${s.id}?`, flags.yes);
+    if (confirmed === null) return 1;
+    if (!confirmed) return 0;
+    let deletionLock = false;
+    if (!sessionLocks.has(s.id)) {
+      try { acquireSessionLock(s.id); deletionLock = true; }
+      catch (e) { out(`${sym.fail} ${e.message}`); return 1; }
+    }
+    try {
+      // Re-read under the exclusive lock; another process may have changed or removed it while confirmation was pending.
+      const current = listSessions().find(x => x.id === s.id);
+      if (!current) { out(`${sym.fail} chat ${s.id} changed while confirmation was pending; nothing was deleted`); return 1; }
+      const files = fs.readdirSync(P.sessions).filter(name => name === `${s.id}.json` || name === `${s.id}.json.tmp` || (name.startsWith(`${s.id}.json.`) && name.endsWith('.tmp')) || (name.startsWith(`${s.id}.`) && name.endsWith('.precompact.bak')));
+      for (const name of files) fs.rmSync(path.join(P.sessions, name), { force: true });
+      if (S && S.id === s.id) {
+        releaseSessionLock(s.id);
+        S = newSession();
+        acquireSessionLock(S.id);
+        out(`current chat deleted; started new session ${S.id}`);
+      }
+      out(`${sym.ok} deleted local chat ${s.id} ${c.dim('(project-file backups remain so agt undo still works; remote Manus tasks are managed with agt tasks)')}`);
+      return 0;
+    } finally { if (deletionLock) releaseSessionLock(s.id); }
   }
+  if (pos[0] && !/^\d+$/.test(pos[0])) { out('usage: agt sessions [count] | agt sessions rm <full-session-id> [--yes]'); return 1; }
+  const count = pos[0] === undefined ? 15 : Number(pos[0]);
+  if (!Number.isSafeInteger(count) || count < 1) { out('session count must be a positive integer'); return 1; }
   const all = listSessions();
   if (!all.length) { out(c.dim('no saved sessions yet')); return 0; }
-  all.slice(0, Number(pos[0]) || 15).forEach(s => {
-    out(`${c.bold(s.id)} ${c.dim('· ' + s.lane + ' · ' + s.messages.length + ' msgs · ' + G.ago(s.updated))}`);
+  all.slice(0, count).forEach(s => {
+    const target = s.model ? `model ${s.model}` : `lane ${s.lane || '?'}`;
+    const remote = s.manusTaskId ? ` · Manus task ${s.manusTaskId}` : '';
+    out(`${c.bold(s.id)} ${c.dim(`· ${target} · ${s.messages.length} msgs · ${G.ago(s.updated)}${remote}`)}`);
     out(c.dim('  ' + s.cwd));
     if (s.title) out('  ' + s.title);
   });
   return 0;
 }
+function detachManusTask(taskId) {
+  let detached = 0, skipped = 0;
+  for (const s of listSessions()) {
+    if (s.manusTaskId !== taskId) continue;
+    if (sessionLockedByOther(s.id)) { skipped++; continue; }
+    s.manusTaskId = null;
+    s.manusUserId = null;
+    try {
+      const file = path.join(P.sessions, `${s.id}.json`);
+      const tmp = `${file}.${process.pid}.${rand(6)}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(s), { flag: 'wx', mode: 0o600 });
+      fs.renameSync(tmp, file);
+      detached++;
+    } catch {}
+  }
+  if (S && S.manusTaskId === taskId) { S.manusTaskId = null; S.manusUserId = null; }
+  return { detached, skipped };
+}
+const safeTerminalText = (value, limit = 240) => String(value || '').replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').slice(0, limit);
+const shellQuote = value => "'" + String(value).replace(/'/g, "'\\''") + "'";
+function printManusTask(task, localSessions = []) {
+  const id = safeTerminalText(task.id);
+  const status = safeTerminalText(task.status || 'unknown');
+  const title = safeTerminalText(task.title || '(untitled)');
+  const created = Number(task.created_at);
+  const when = Number.isFinite(created) && created > 0 ? G.ago(new Date(created * 1000).toISOString()) : 'date unknown';
+  const credits = Number.isFinite(Number(task.credit_usage)) ? ` · ${Number(task.credit_usage)} credits` : '';
+  const linked = localSessions.filter(s => s.manusTaskId === task.id).map(s => s.id);
+  out(`${c.bold(id)} ${c.cyan(status)} · ${title} ${c.dim(`· ${safeTerminalText(task.task_type || 'task')} · ${when}${credits}`)}`);
+  if (linked.length) out(c.dim('  linked AGT chat: ' + linked.join(', ')));
+  if (task.has_running_background_jobs) out(c.dim('  background jobs are still running'));
+  if (task.task_url) out(c.dim('  ' + safeTerminalText(task.task_url)));
+}
+async function cmdTasks(pos = [], flags = {}) {
+  let action = pos[0] || 'list';
+  if (action === 'list') {
+    pos = pos.slice(1);
+    if (pos.length) { out('usage: agt tasks [list] [--limit <1-100>] [--cursor <cursor>] [--include-deleted]'); return 1; }
+  }
+  else if (!['show', 'detail', 'resume', 'stop', 'delete', 'rm'].includes(action)) {
+    out('usage: agt tasks [list|show <id>|resume <id>|stop <id>|delete <id>]');
+    return 1;
+  } else pos = pos.slice(1);
+  const taskId = pos[0];
+  if (pos.length > 1) { out('usage: agt tasks [list|show <id>|resume <id>|stop <id>|delete <id>]'); return 1; }
+  const provider = CFG.providers.manus;
+  const key = G.keyOf(CFG, 'manus');
+  if (!provider || provider.type !== 'manus') { out(`${sym.fail} Manus is not configured in this AGT profile`); return 1; }
+  if (!key) { out(`${sym.fail} MANUS_API_KEY is not set. Set it with: agt keys set manus`); return 1; }
+  try {
+    if (action === 'list') {
+      const limit = flags.limit === undefined ? (flags.n === undefined ? 20 : flags.n) : flags.limit;
+      const result = await Manus.listTasks({ provider, key, limit, cursor: flags.cursor, includeDeleted: !!flags['include-deleted'] });
+      const tasks = Array.isArray(result.data) ? result.data : [];
+      if (!tasks.length) out('no Manus tasks on this page');
+      const localSessions = listSessions();
+      for (const task of tasks) printManusTask(task, localSessions);
+      if (result.has_more && result.next_cursor) out(c.dim(`more tasks: agt tasks --limit ${Number(limit)} --cursor ${shellQuote(safeTerminalText(result.next_cursor, 4096))}`));
+      out(c.dim('This is your Manus account task list, not only tasks created by AGT. Use "agt tasks show <id>" for details.'));
+      return 0;
+    }
+    if (!taskId) { out(`usage: agt tasks ${action === 'detail' ? 'show' : action} <task-id>${action === 'stop' || action === 'delete' || action === 'rm' ? ' [--yes]' : ''}`); return 1; }
+    const detail = await Manus.getTask({ provider, key, taskId });
+    const task = detail.task;
+    if (!task) { out(`${sym.fail} Manus did not return that task`); return 1; }
+    if (typeof task.id !== 'string' || task.id !== String(taskId).trim()) { out(`${sym.fail} Manus returned a task ID that does not match the requested ID; no task action was taken`); return 1; }
+    if (action === 'resume') {
+      if (task.status !== 'stopped') {
+        const hint = task.status === 'waiting' ? 'handle its pending question or action in Manus first' : task.status === 'running' ? 'wait for it to stop, or stop it before continuing' : 'only a stopped Manus task can be continued from AGT';
+        out(`${sym.fail} task status is ${safeTerminalText(task.status || 'unknown')}; ${hint}`);
+        return 1;
+      }
+      if (task.has_running_background_jobs) { out(`${sym.fail} this task still has background jobs; let them finish in Manus before continuing it`); return 1; }
+      if (task.task_type && !['standard', 'project'].includes(task.task_type)) { out(`${sym.fail} only standard or project tasks can be continued from AGT`); return 1; }
+      const otherLinks = listSessions().filter(s => s.manusTaskId === task.id && (!S || s.id !== S.id));
+      if (otherLinks.length) {
+        const active = otherLinks.find(s => sessionLockedByOther(s.id));
+        out(`${sym.fail} Manus task ${safeTerminalText(task.id)} is already linked to local chat ${otherLinks[0].id}${active ? ' which is active' : ''}; continue it with: agt resume ${otherLinks[0].id}`);
+        return 1;
+      }
+      if (S) {
+        const previous = S.manusTaskId;
+        model = 'manus/agent'; S.model = model; S.manusTaskId = task.id; S.manusUserId = null; S.manusTarget = model;
+        saveSession();
+        out(`${sym.ok} attached this chat to stopped Manus task ${safeTerminalText(task.id)}; your next message continues it${previous && previous !== task.id ? ` (the previously linked task ${safeTerminalText(previous)} remains in your Manus account)` : ''}`);
+        return 0;
+      }
+      out(`${sym.ok} opening a chat pinned to stopped Manus task ${safeTerminalText(task.id)}`);
+      return cmdChat([], { model: 'manus/agent' }, false, task.id);
+    }
+    if (action === 'show' || action === 'detail') {
+      printManusTask(task, listSessions());
+      if (task.share_visibility) out(`visibility: ${safeTerminalText(task.share_visibility)}`);
+      if (task.agent_profile) out(`agent profile: ${safeTerminalText(task.agent_profile)}`);
+      return 0;
+    }
+    if (action === 'stop') {
+      if (task.status !== 'running') { out(`Manus task ${safeTerminalText(task.id)} is ${safeTerminalText(task.status || 'not running')}; no stop was sent`); return 0; }
+      const confirmed = await confirmAction(`Stop running Manus task ${safeTerminalText(task.id)}?`, flags.yes);
+      if (confirmed === null) return 1;
+      if (!confirmed) return 0;
+      await Manus.stopTask({ provider, key, taskId: task.id });
+      out(`${sym.ok} stop requested for ${safeTerminalText(task.id)}. Manus documents that a stopped task can still be resumed.`);
+      return 0;
+    }
+    if (action === 'delete' || action === 'rm') {
+      if (task.status === 'running') { out(`${sym.warn} task is running; stop it first with: agt tasks stop ${safeTerminalText(task.id)}`); return 1; }
+      if (task.has_running_background_jobs) { out(`${sym.warn} Manus reports background jobs are still running; wait for them to finish before deleting this task.`); return 1; }
+      const confirmed = await confirmAction(`Permanently delete remote Manus task ${safeTerminalText(task.id)}?`, flags.yes);
+      if (confirmed === null) return 1;
+      if (!confirmed) return 0;
+      await Manus.deleteTask({ provider, key, taskId: task.id });
+      const { detached, skipped } = detachManusTask(task.id);
+      out(`${sym.ok} deleted Manus task ${safeTerminalText(task.id)}${detached ? ` and detached ${detached} local AGT chat${detached === 1 ? '' : 's'}` : ''}${skipped ? `; ${skipped} active chat${skipped === 1 ? ' was' : 's were'} left unchanged` : ''}`);
+      return 0;
+    }
+    return 1;
+  } catch (e) {
+    out(`${sym.fail} ${e.message}`);
+    if ((action === 'delete' || action === 'rm') && /agent-related|cannot be deleted/i.test(e.message)) out(c.dim('Manus does not allow permanent deletion of some agent-related tasks.'));
+    return 1;
+  }
+}
 function cmdShow(pos, flags) {
-  const s = findSession(pos[0]);
-  if (!s) { out('usage: agt show <session-id>   (list them: agt sessions)'); return 1; }
+  const matches = sessionMatches(pos[0]);
+  const s = matches.length === 1 ? matches[0] : null;
+  if (!s) {
+    if (matches.length > 1) out(`session id is ambiguous; use a longer id: ${matches.map(x => x.id).join(', ')}`);
+    else out('usage: agt show <session-id>   (list them: agt sessions)');
+    return 1;
+  }
   out(`${c.bold(s.id)} ${c.dim('· ' + s.cwd + ' · ' + s.lane)}`);
   const cut = t => (flags.full || t.length <= 300 ? t : t.slice(0, 300) + c.dim(`… [${t.length} chars, use --full]`));
   for (const m of s.messages) {
@@ -1026,19 +1440,23 @@ function cmdShow(pos, flags) {
 }
 function cmdChanges(pos, flags) {
   const all = G.readJsonl(P.changes);
-  const undone = new Set(all.filter(x => x.action === 'undo' && x.status === 'applied').map(x => x.of));
+  const undone = new Set(all.filter(x => x.action === 'undo' && x.status === 'applied').map(x => String(x.of)));
   const rows = all.filter(x => x.action !== 'undo').slice(-(Number(flags.n) || 15));
   if (!rows.length) { out(c.dim('no changes recorded yet')); return 0; }
   for (const x of rows) {
     const mark = x.status === 'denied' ? sym.fail : x.status === 'failed' ? sym.warn : sym.ok;
-    const what = x.action === 'run' ? `$ ${x.command}` : `${x.action} ${x.path}`;
+    const what = x.action === 'run' ? `$ [command details redacted${x.command_length ? ` · ${x.command_length} chars` : ''}]` : `${x.action} ${x.path}`;
     const tail = x.action === 'run' ? `exit ${x.exit}` : x.status === 'denied' ? 'denied' : `+${x.added} -${x.removed}`;
     out(`${c.dim('#' + x.id)} ${mark} ${what}`);
-    out(c.dim(`     ${tail}${undone.has(x.id) ? ' · undone' : ''} · ${G.ago(x.ts)}${x.reason ? ' · reason: ' + x.reason : ''}`));
+    out(c.dim(`     ${tail}${undone.has(String(x.id)) ? ' · undone' : ''} · ${G.ago(x.ts)}${x.reason ? ' · reason: ' + x.reason : ''}`));
   }
   return 0;
 }
-const cmdUndo = (pos, flags) => undoChange(askOnce, pos[0] ? Number(pos[0]) : null, !!flags.force);
+const cmdUndo = (pos, flags) => {
+  const id = pos[0] || null;
+  if (id && !/^[A-Za-z0-9_-]{1,128}$/.test(id)) { out('change ID must contain only letters, digits, _ or -'); return 1; }
+  return undoChange(askOnce, id, !!flags.force);
+};
 
 async function cmdDoctor() {
   const n = { ok: 0, warn: 0, fail: 0 };
@@ -1086,39 +1504,44 @@ async function cmdDoctor() {
 function cmdHelp(pos) {
   if (pos[0] && COMMANDS[pos[0]]) {
     const k = COMMANDS[pos[0]];
-    out(`${c.bold('agt ' + pos[0])} - ${k.desc}\n  ${k.usage}`);
+    out(`${c.bold('agt ' + pos[0])} — ${k.desc}\nUsage: ${k.usage}`);
     if (k.notes) out('\n' + k.notes);
     return 0;
   }
-  out(`${c.bold('agt')} ${c.dim('v' + G.VERSION)}  free-tier coding agent for your terminal\n`);
-  out(c.bold('Commands'));
-  for (const [n, k] of Object.entries(COMMANDS)) out(`  ${c.cyan(n.padEnd(9))}${k.desc}`);
-  out(`\n${c.dim('agt help <command> for details')}`);
+  if (pos[0]) { out(`${sym.fail} unknown help topic "${pos[0]}"\n`); }
+  out(`${c.bold('agt')} ${c.dim('v' + G.VERSION)}  terminal coding agent with lanes, exact model pins, saved chats, and Manus task controls\n`);
+  out(c.bold('Commands and syntax'));
+  for (const [n, k] of Object.entries(COMMANDS)) {
+    out(`  ${c.cyan(n.padEnd(10))}${k.usage}`);
+  }
+  out(`\n${c.dim('Details: agt help <command>   Equivalent: agt <command> --help or -h')}`);
+  out(`${c.dim('In chat, type /help. Example exact Manus model: /model manus/agent or agt --model manus/agent.')}`);
   out(`\n${c.bold('Data')}  ${c.dim(P.home)}\n${c.dim('  config.json  keys.env  sessions/  logs/  changes.jsonl  backups/  proposed/')}`);
-  return 0;
+  return pos[0] ? 1 : 0;
 }
 
 const COMMANDS = {
-  chat: { desc: 'talk to the agent in this folder', usage: 'agt chat ["first message"] [--plan|--edit|--lane NAME] [--model NAME] [--keep] [--debug]',
-    notes: 'Starts the router if needed and stops it on exit (unless --keep, or it was already running).\nA lane is an ordered failover list. --model (or /model in chat) pins one exact model instead:\nan alias like "fast", or provider/model-id. Every file change asks first: y / n / d / v / s.', run: (p, f) => cmdChat(p, f, false) },
-  resume: { desc: 'continue the latest chat for this folder', usage: 'agt resume [session-id]', run: (p, f) => cmdChat([], f, p[0] || true) },
-  setup: { desc: 'guided API key setup (works on every OS)', usage: 'agt setup', run: cmdSetup },
-  keys: { desc: 'list, set or remove API keys', usage: 'agt keys [list|set <provider>|remove <provider>|path]', notes: 'Keys live in a private file in the data folder; real environment variables always win.\nScripted: echo "$KEY" | agt keys set groq --stdin', run: cmdKeys },
-  models: { desc: 'lanes, aliases and available models', usage: 'agt models [provider] [--live]', notes: '--live asks each provider which model ids it offers (uses no tokens).', run: cmdModels },
-  router: { desc: 'control the router server', usage: 'agt router start|stop|restart|status|reset|logs', run: cmdRouter },
-  health: { desc: 'router health check', usage: 'agt health [--deep] [--json]', notes: '--deep also tests each provider key live (uses no tokens).', run: cmdHealth },
-  stats: { desc: 'requests per provider, by day', usage: 'agt stats', run: cmdStats },
-  doctor: { desc: 'diagnose problems with setup, keys and router', usage: 'agt doctor', run: cmdDoctor },
-  logs: { desc: 'readable router or agent logs', usage: 'agt logs [router|agent] [-n 40] [-f] [--raw]', run: cmdLogs },
-  sessions: { desc: 'list saved chats', usage: 'agt sessions [count] | agt sessions rm <id>', run: cmdSessions },
-  show: { desc: 'print a saved chat', usage: 'agt show <session-id> [--full]', run: cmdShow },
-  changes: { desc: 'what the agent changed or tried to', usage: 'agt changes [-n 15]', run: cmdChanges },
-  undo: { desc: 'restore a file the agent changed', usage: 'agt undo [change-id] [--force]', run: cmdUndo },
-  config: { desc: 'view or edit lanes, aliases, providers and limits', usage: 'agt config [show|path|edit]', run: cmdConfig },
-  resources: { desc: 'show editable Manus instructions, project knowledge and skills', usage: 'agt resources', run: cmdResources },
-  update: { desc: 'update to the latest version', usage: 'agt update [--check]', run: cmdUpdate },
-  help: { desc: 'this help', usage: 'agt help [command]', run: cmdHelp },
-  version: { desc: 'print the version', usage: 'agt version', run: () => { out('agt ' + G.VERSION); return 0; } },
+  chat: { desc: 'chat with an agent in this folder', usage: 'agt [chat] ["first message"] [--plan|--edit|--lane <name>] [--model <alias|provider/model-id>] [--keep] [--debug]',
+    notes: 'A lane is an ordered failover list. --model pins one exact model with no failover. Example: --model manus/agent. In chat use /lane <name> or /model <alias|provider/model-id>; /model auto clears the pin. File writes and commands ask for approval.', run: (p, f) => cmdChat(p, f, false) },
+  resume: { desc: 'continue a saved chat for this folder', usage: 'agt resume [session-id] [--model <target>]', notes: 'With no ID, resumes the most recent chat for the current folder. Use agt sessions to list chats.', run: (p, f) => cmdChat([], f, p[0] || true) },
+  setup: { desc: 'guided API key setup', usage: 'agt setup', notes: 'Prompts for configured providers; press Enter to skip a provider.', run: cmdSetup },
+  keys: { desc: 'list, set, remove, or locate API keys', usage: 'agt keys [list|set <provider|VARIABLE> [--stdin] [--no-test]|remove <provider|VARIABLE>|path]', notes: 'Keys are kept in the private data folder; environment variables take precedence. For scripts: printf %s "$KEY" | agt keys set groq --stdin.', run: cmdKeys },
+  models: { desc: 'list lanes, aliases, and provider model IDs', usage: 'agt models [provider] [--live]', notes: 'Use agt models manus --live to see the exact Manus pin manus/agent. In chat use /models or /models live. --live probes provider model lists; it does not send a chat request.', run: cmdModels },
+  router: { desc: 'start, stop, restart, or inspect the local router', usage: 'agt router [start|stop|restart|status|reset|logs]', notes: 'No subcommand means status. reset clears provider cooldowns; logs shows the router log.', run: cmdRouter },
+  health: { desc: 'show local router health', usage: 'agt health [--deep] [--json]', notes: '--deep probes configured provider keys. --json prints the health response as JSON.', run: cmdHealth },
+  stats: { desc: 'show request counts by provider and day', usage: 'agt stats', notes: 'Reads live stats when the router runs, otherwise the last persisted snapshot. Provider quota reset times differ, so counts are estimates.', run: cmdStats },
+  doctor: { desc: 'diagnose setup, keys, providers, and router', usage: 'agt doctor', notes: 'Reports problems and suggested fixes. Provider probes use the configured keys.', run: cmdDoctor },
+  logs: { desc: 'read router or agent logs', usage: 'agt logs [router|agent] [-n <count>] [-f] [--raw]', notes: 'Default is the router log and last 40 lines. -f follows new lines; --raw prints unformatted log text.', run: cmdLogs },
+  sessions: { desc: 'list, inspect, or delete local AGT chats', usage: 'agt sessions [count] | agt sessions rm <full-session-id> [--yes]', notes: 'These are local AGT transcripts, separate from Manus remote tasks. Deletion asks for confirmation; --yes is for scripts. Project-file backups are kept for agt undo. Use agt show <id> to inspect a chat. In chat: /sessions or /sessions rm <full-id>.', run: cmdSessions },
+  tasks: { desc: 'list and manage remote Manus account tasks', usage: 'agt tasks [list] [--limit <1-100>] [--cursor <cursor>] [--include-deleted] | agt tasks show <task-id> | agt tasks resume <task-id> | agt tasks stop <task-id> [--yes] | agt tasks delete <task-id> [--yes]', notes: 'Lists tasks for the Manus account tied to MANUS_API_KEY, not just AGT-created tasks. resume continues a stopped task only when no background jobs remain; running/waiting tasks are refused to avoid collisions or skipping a pending confirmation. If already linked to a saved AGT chat, use agt resume <session-id> to avoid duplicate local histories. stop interrupts a running task. delete is permanent, requires confirmation, and Manus may forbid deleting agent-related tasks. After deletion, linked local chats are detached. In chat: /tasks, /tasks show <id>, /tasks resume <id>, /tasks stop <id>, /tasks delete <id>.', run: cmdTasks },
+  show: { desc: 'print a saved local chat transcript', usage: 'agt show <session-id> [--full]', notes: 'agt sessions lists IDs. Output is clipped by default; --full prints full tool results.', run: cmdShow },
+  changes: { desc: 'show files and commands the agent changed or attempted', usage: 'agt changes [-n <count>]', notes: 'Reads the local change log; the default is the latest 15 entries. Shell command text is omitted from logs and this view.', run: cmdChanges },
+  undo: { desc: 'restore a file changed by the agent', usage: 'agt undo [change-id] [--force]', notes: 'Without an ID, chooses the latest applied change. Change IDs are opaque strings. The command checks whether the file changed since; --force overrides that content check but not path/backup safety checks. It asks before restoring.', run: cmdUndo },
+  config: { desc: 'view, locate, or edit AGT configuration', usage: 'agt config [show|path|edit]', notes: 'No subcommand prints config. edit opens VISUAL, EDITOR, or the platform default. Restart the router if you change its port.', run: cmdConfig },
+  resources: { desc: 'locate editable Manus instructions, project notes, and skills', usage: 'agt resources', notes: 'Seeds only missing resource files; existing edits are preserved.', run: cmdResources },
+  update: { desc: 'check for or install a newer registry release', usage: 'agt update [--check]', notes: '--check only reports availability. Updating requires an npm-installed copy and a published npm release.', run: cmdUpdate },
+  help: { desc: 'show command list or detailed help for one command', usage: 'agt help [command]', notes: 'Also: agt <command> --help or -h. In an interactive chat, /help lists chat commands.', run: cmdHelp },
+  version: { desc: 'print the installed AGT version', usage: 'agt version | agt --version | agt -v', run: () => { out('agt ' + G.VERSION); return 0; } },
 };
 
 (async () => {

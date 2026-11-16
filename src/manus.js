@@ -1,7 +1,7 @@
 'use strict';
 
 const DEFAULT_URL = 'https://api.manus.ai';
-const MAX_MESSAGE_CHARS = 16000; // leaves headroom below the API's ~5k-token text limit
+const MAX_MESSAGE_CHARS = 10000; // Manus limits estimated tokens, so an explicit invalid-argument response triggers smaller retries.
 
 const clip = (text, n) => {
   text = String(text || '');
@@ -38,8 +38,13 @@ async function request(base, key, route, { method = 'GET', body, signal } = {}) 
     let data;
     try { data = text ? JSON.parse(text) : {}; } catch { data = {}; }
     if (r.status === 429 && attempt < 4) {
-      const header = Number(r.headers.get('retry-after'));
-      await sleep(header > 0 ? Math.min(header * 1000, 10000) : Math.min(1000 * (2 ** attempt), 10000), signal);
+      const retryAfter = r.headers.get('retry-after');
+      let delay = null;
+      if (retryAfter && /^\d+(?:\.\d+)?$/.test(retryAfter.trim())) delay = Number(retryAfter.trim()) * 1000;
+      else if (retryAfter && Number.isFinite(Date.parse(retryAfter))) delay = Math.max(0, Date.parse(retryAfter) - Date.now());
+      if (delay === null) delay = Math.floor(Math.random() * Math.min(1000 * (2 ** attempt), 10000));
+      if (!Number.isFinite(delay) || delay > 2147483647) throw responseError(r.status, data, text);
+      await sleep(delay, signal);
       continue;
     }
     if (!r.ok || data.ok === false) throw responseError(r.status, data, text);
@@ -69,7 +74,7 @@ function outputSchema(names) {
 
 const CONTRACT = `You are Manus, the reasoning agent inside AGT CLI. AGT CLI owns the user's local project and execution environment; your remote Manus workspace is not the project. Never claim to have read or changed local files unless AGT returned that result. Do not use remote shell, filesystem, browser, connectors, or other Manus-side actions to modify this project. Use only the local tools listed below for project operations. Return exactly one requested local tool call per turn, or a normal user-facing final response. A tool request is a proposal: AGT will apply its existing path restrictions and ask the user to approve every file write and command. Never bypass or imply approval. Use complete project-relative paths and choose the narrowest suitable operation. If more information is needed, ask the user in a normal response.`;
 
-function makeMessage(body, isNewTask) {
+function makeMessage(body, isNewTask, maxChars = MAX_MESSAGE_CHARS) {
   const state = body.manus || {};
   const input = clip(state.input || '', 6000);
   const editable = clip(state.instructions || '', 1800);
@@ -86,12 +91,34 @@ function makeMessage(body, isNewTask) {
   ];
   let text = CONTRACT + sections.join('');
   for (const i of [4, 3, 1, 2, 0, 5]) {
-    if (text.length <= MAX_MESSAGE_CHARS) break;
-    const excess = text.length - MAX_MESSAGE_CHARS;
+    if (text.length <= maxChars) break;
+    const excess = text.length - maxChars;
     sections[i] = sections[i].slice(0, Math.max(0, sections[i].length - excess));
     text = CONTRACT + sections.join('');
   }
   return { content: text };
+}
+
+function isMessageLimitError(error) {
+  return error && (error.status === 400 || error.code === 'invalid_argument')
+    && /invalid.argument|estimated.token|token.limit|message.*(?:long|large|limit|exceed)|content.*(?:long|large|limit|exceed)/i.test(error.message);
+}
+async function requestMessage(base, key, route, state, isNewTask, schema, signal, taskId = null) {
+  let maxChars = MAX_MESSAGE_CHARS;
+  let message = makeMessage(state, isNewTask, maxChars);
+  for (let attempt = 0; ; attempt++) {
+    const body = taskId
+      ? { task_id: taskId, message, structured_output_schema: schema, clear_connectors: true }
+      : { message, structured_output_schema: schema, interactive_mode: true, share_visibility: 'private', clear_connectors: true };
+    try {
+      const result = await request(base, key, route, { method: 'POST', body, signal });
+      return { result, message };
+    } catch (error) {
+      if (!isMessageLimitError(error) || attempt >= 4 || maxChars <= 900) throw error;
+      maxChars = Math.max(900, Math.floor(maxChars / 2));
+      message = makeMessage(state, isNewTask, maxChars);
+    }
+  }
 }
 
 function latestInput(body) {
@@ -216,7 +243,8 @@ async function run({ provider = {}, key, body, signal, timeoutMs = 600000, pollM
   let taskId = state.task_id || null;
   if (state.user_id && state.user_id !== identity.user_id) taskId = null;
   const schema = outputSchema(names);
-  let message = makeMessage({ ...body, manus: { ...state, input: latestInput(body) } }, !taskId);
+  const messageState = { ...body, manus: { ...state, input: latestInput(body) } };
+  let message = makeMessage(messageState, !taskId);
   let startedAt = Date.now();
   let baselineIds = null;
   let baselineTimestamp = null;
@@ -237,13 +265,15 @@ async function run({ provider = {}, key, body, signal, timeoutMs = 600000, pollM
         return blocked;
       }
       startedAt = Date.now();
-      await request(base, key, '/v2/task.sendMessage', {
-        method: 'POST',
-        body: { task_id: taskId, message, structured_output_schema: schema },
-        signal,
-      });
+      const sent = await requestMessage(base, key, '/v2/task.sendMessage', messageState, false, schema, signal, taskId);
+      message = sent.message;
     } catch (e) {
-      if (!(e.status === 404 || e.code === 'not_found' || e.code === 'permission_denied')) throw e;
+      if (!(e.status === 404 || e.code === 'not_found' || e.code === 'permission_denied')) {
+        e.manusTaskId = taskId;
+        e.manusUserId = identity.user_id;
+        if (!e.status || e.status >= 500) e.message = `Manus may have accepted the follow-up for task ${taskId}; inspect that task before retrying. ${e.message}`;
+        throw e;
+      }
       taskId = null;
       baselineIds = null;
       baselineTimestamp = null;
@@ -253,25 +283,32 @@ async function run({ provider = {}, key, body, signal, timeoutMs = 600000, pollM
 
   if (!taskId) {
     startedAt = Date.now();
-    const created = await request(base, key, '/v2/task.create', {
-      method: 'POST',
-      body: {
-        message,
-        structured_output_schema: schema,
-        interactive_mode: true,
-        share_visibility: 'private',
-      },
-      signal,
-    });
+    let created;
+    try {
+      const response = await requestMessage(base, key, '/v2/task.create', messageState, true, schema, signal);
+      message = response.message;
+      created = response.result;
+    } catch (e) {
+      if (!e.status || e.status >= 500) {
+        e.manusAmbiguousCreate = true;
+        e.message = `Manus did not confirm task creation; the request may have been accepted. Check "agt tasks" in Manus before retrying. ${e.message}`;
+      }
+      throw e;
+    }
     taskId = created.task_id;
-    if (!taskId) throw new Error('Manus API did not return a task_id.');
+    if (!taskId) {
+      const error = new Error('Manus accepted task creation but returned no task_id; inspect your Manus task list before retrying.');
+      error.manusAmbiguousCreate = true;
+      throw error;
+    }
   }
 
   let result;
   try {
     result = await pollTask(base, key, taskId, startedAt, names, signal, { timeoutMs, pollMs, baselineIds, baselineTimestamp });
   } catch (e) {
-    if (e.manusTaskId) e.manusUserId = identity.user_id;
+    if (!e.manusTaskId) e.manusTaskId = taskId;
+    e.manusUserId = identity.user_id;
     throw e;
   }
   result.manus_user_id = identity.user_id;
@@ -279,4 +316,41 @@ async function run({ provider = {}, key, body, signal, timeoutMs = 600000, pollM
   return result;
 }
 
-module.exports = { run, outputSchema, makeMessage, asChatCompletion };
+function managementArgs(provider, key, taskId, requireId = false) {
+  if (!key) throw new Error('MANUS_API_KEY is not set. Set it with: agt keys set manus');
+  const base = String(provider && provider.url || DEFAULT_URL).replace(/\/+$/, '');
+  if (taskId === undefined) {
+    if (requireId) throw new Error('Manus task ID is required');
+    return { base, key };
+  }
+  const id = String(taskId || '').trim();
+  if (!id || id.length > 512) throw new Error('a valid Manus task ID is required');
+  return { base, key, id };
+}
+
+async function listTasks({ provider = {}, key, limit = 20, cursor, includeDeleted = false, signal } = {}) {
+  const { base, key: apiKey } = managementArgs(provider, key);
+  const n = Number(limit);
+  if (!Number.isInteger(n) || n < 1 || n > 100) throw new Error('Manus task list limit must be an integer from 1 to 100');
+  const query = new URLSearchParams({ limit: String(n), order: 'desc' });
+  if (cursor) query.set('cursor', String(cursor));
+  if (includeDeleted) query.set('include_deleted', 'true');
+  return request(base, apiKey, `/v2/task.list?${query}`, { signal });
+}
+
+async function getTask({ provider = {}, key, taskId, signal } = {}) {
+  const { base, key: apiKey, id } = managementArgs(provider, key, taskId, true);
+  return request(base, apiKey, `/v2/task.detail?task_id=${encodeQuery(id)}`, { signal });
+}
+
+async function stopTask({ provider = {}, key, taskId, signal } = {}) {
+  const { base, key: apiKey, id } = managementArgs(provider, key, taskId, true);
+  return request(base, apiKey, '/v2/task.stop', { method: 'POST', body: { task_id: id }, signal });
+}
+
+async function deleteTask({ provider = {}, key, taskId, signal } = {}) {
+  const { base, key: apiKey, id } = managementArgs(provider, key, taskId, true);
+  return request(base, apiKey, '/v2/task.delete', { method: 'POST', body: { task_id: id }, signal });
+}
+
+module.exports = { run, outputSchema, makeMessage, asChatCompletion, listTasks, getTask, stopTask, deleteTask };

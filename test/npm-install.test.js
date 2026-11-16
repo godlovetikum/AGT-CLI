@@ -22,7 +22,7 @@ test('npm pack contains what users need and none of what they do not', { skip: !
   assert.strictEqual(r.status, 0, r.stderr);
   const info = JSON.parse(r.stdout)[0];
   const files = info.files.map(f => f.path.replace(/\\/g, '/'));
-  for (const need of ['package.json', 'README.md', 'LICENSE', 'bin/agt.js', 'src/cli.js', 'src/router.js', 'src/common.js', 'src/keys.js', 'src/manus.js', 'src/textutil.js', 'resources/manus/AGT_INSTRUCTIONS.md', 'resources/templates/PROJECT_KNOWLEDGE.md', 'resources/skills/testing-debugging.md', 'docs/MANUS.md', 'scripts/postinstall.js'])
+  for (const need of ['package.json', 'README.md', 'LICENSE', 'bin/agt.js', 'src/cli.js', 'src/router.js', 'src/common.js', 'src/keys.js', 'src/manus.js', 'src/path-policy.js', 'src/textutil.js', 'resources/manus/AGT_INSTRUCTIONS.md', 'resources/templates/PROJECT_KNOWLEDGE.md', 'resources/skills/testing-debugging.md', 'docs/MANUS.md', 'scripts/postinstall.js'])
     assert.ok(files.includes(need), `missing ${need}`);
   for (const bad of files.filter(f => /^(test|\.github|\.git|node_modules)\//.test(f) || f === 'install.js'))
     assert.fail(`should not be published: ${bad}`);
@@ -54,4 +54,24 @@ test('installing the tarball gives working agt and agt-cli commands', { skip: !a
   const doc = spawnSync(bin('agt'), ['doctor'], { encoding: 'utf8', env, shell: WIN, timeout: 30000 });
   assert.strictEqual(doc.status, 0, doc.stdout + doc.stderr);
   assert.match(doc.stdout, /0 problems/);
+});
+
+test('npm upgrades the same global prefix when the package version increases and preserves AGT_HOME', { skip: !available && 'npm not available' }, () => {
+  const tarball = fs.readFileSync(path.join(tmp, 'tarball.txt'), 'utf8');
+  const prefix = path.join(tmp, 'upgrade-prefix'), old = path.join(tmp, 'old-package');
+  fs.mkdirSync(path.join(old, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(old, 'package.json'), JSON.stringify({ name: 'agt-cli', version: '1.1.0', bin: { agt: 'bin/agt.js' } }));
+  fs.writeFileSync(path.join(old, 'bin', 'agt.js'), '#!/usr/bin/env node\nconsole.log("agt 1.1.0")\n');
+  const installOld = npm(['install', '-g', '--prefix', prefix, old]);
+  assert.strictEqual(installOld.status, 0, installOld.stdout + installOld.stderr);
+  const bin = process.platform === 'win32' ? path.join(prefix, 'agt.cmd') : path.join(prefix, 'bin', 'agt');
+  const before = spawnSync(bin, ['version'], { encoding: 'utf8', shell: WIN });
+  assert.strictEqual(before.stdout.trim(), 'agt 1.1.0');
+  const data = path.join(tmp, 'upgrade-data'); fs.mkdirSync(data, { recursive: true });
+  fs.writeFileSync(path.join(data, 'user-note.txt'), 'keep this');
+  const installNew = npm(['install', '-g', '--prefix', prefix, tarball]);
+  assert.strictEqual(installNew.status, 0, installNew.stdout + installNew.stderr);
+  const after = spawnSync(bin, ['version'], { encoding: 'utf8', env: { ...process.env, AGT_HOME: data, AGT_NO_UPDATE_CHECK: '1' }, shell: WIN });
+  assert.strictEqual(after.stdout.trim(), `agt ${VERSION}`);
+  assert.strictEqual(fs.readFileSync(path.join(data, 'user-note.txt'), 'utf8'), 'keep this');
 });
